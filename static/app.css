@@ -89,7 +89,7 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke
 .bubble{flex:1;min-width:0}
 .msg.user .bubble{background:var(--user);border:1px solid var(--line2);border-radius:var(--radius);padding:12px 15px}
 .msg.assistant .bubble{padding:2px 2px 0}
-.body{white-space:pre-wrap;word-break:break-word}
+.body{white-space:normal;word-break:break-word}
 .body p{margin:0 0 10px}
 .body p:last-child{margin-bottom:0}
 .body code{font-family:var(--mono);font-size:.9em;background:var(--bg2);border:1px solid var(--line);

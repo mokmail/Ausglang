@@ -84,7 +84,7 @@ function configureMarked() {
     /^(https?:|data:image\/)/i.test(href || '')
       ? `<img src="${esc(href)}" alt="${esc(text || '')}" title="${esc(title || '')}" loading="lazy">`
       : `<span class="muted">[image blocked: ${esc(href || '')}]</span>`;
-  window.marked.use({ renderer, gfm: true, breaks: false, headerIds: false, mangle: false });
+  window.marked.use({ renderer, gfm: true, breaks: true, headerIds: false, mangle: false });
   window.marked.__configured = true;
 }
 
@@ -661,8 +661,12 @@ function attachHtmlPreviews(scope) {
     wrap.innerHTML = `<div class="hp-head"><span>sandboxed preview</span><span class="grow"></span>
       <button class="mini">hide</button></div><iframe sandbox="allow-scripts" loading="lazy"></iframe>`;
     const frame = wrap.querySelector('iframe');
-    const probe = `<script>addEventListener('load',()=>{const h=Math.min(1200,Math.max(60,document.documentElement.scrollHeight));
-      parent.postMessage({__htmlPreview:1,h},'*')});<\/script>`;
+    const probe = `<script>
+      const send=()=>{const b=document.body,c=document.documentElement;
+        const h=Math.min(1400,Math.max(48,Math.max(b.scrollHeight,b.offsetHeight,c.scrollHeight)));
+        parent.postMessage({__htmlPreview:1,h},'*')};
+      addEventListener('load',()=>{send();setTimeout(send,150);setTimeout(send,600)});
+    <\/script>`;
     frame.srcdoc = pre.dataset.code + probe;
     frame.style.height = '90px';
     wrap.querySelector('button').onclick = () => {
