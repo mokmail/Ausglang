@@ -142,7 +142,11 @@ def compose_system(
             for s in h["subagents"] if s.get("name")
         )
         if body:
-            body += "\n\nCall one with the `delegate` tool: {\"tool\": \"delegate\", \"arguments\": {\"name\": ..., \"task\": ...}}"
+            body += (
+                "\n\nCall one either by its own name as a tool "
+                "({\"tool\": \"<name>\", \"arguments\": {\"task\": ...}}) or with "
+                "{\"tool\": \"delegate\", \"arguments\": {\"name\": ..., \"task\": ...}}."
+            )
             sections.append(("subagents", _block("Subagents you can delegate to", body)))
 
     if h["plugins"]:

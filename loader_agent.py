@@ -69,6 +69,7 @@ class Job:
         }
         self.proc: subprocess.Popen | None = None
         self.cancel = threading.Event()
+        self.last_payload: dict[str, Any] | None = None
 
     def get(self) -> dict[str, Any]:
         with self.lock:
@@ -207,6 +208,7 @@ def worker(payload: dict[str, Any]) -> None:
                 JOB.set(state="cancelled", message="cancelled by user")
                 return
             if up():
+                JOB.last_payload = dict(payload)
                 JOB.set(state="ready", message=f"{model} ready", finished=time.time())
                 return
             if JOB.proc and JOB.proc.poll() is not None:
@@ -253,6 +255,7 @@ def cancel() -> dict[str, Any]:
 @app.post("/stop", tags=["server"], summary="Stop the SGLang server")
 def stop() -> dict[str, Any]:
     JOB.cancel.set()
+    JOB.last_payload = None
     _run(["pkill", "-f", "sglang.launch_server --model-path"])
     for _ in range(40):
         if not up():
@@ -270,6 +273,22 @@ def logs(tail: int = 200) -> list[str]:
     return SERVER_LOG.read_text(errors="replace").replace("\r", "\n").splitlines()[-tail:]
 
 
+def supervisor(interval: float = 15.0) -> None:
+    """Restart the last loaded model if SGLang dies (the loader owns lifecycle)."""
+    while True:
+        time.sleep(interval)
+        try:
+            payload = JOB.last_payload
+            if not payload or JOB.get()["state"] in ACTIVE:
+                continue
+            if not up():
+                print(f"[supervisor] {payload['model']} down — restarting", flush=True)
+                JOB.cancel.clear()
+                worker(dict(payload))
+        except Exception as e:  # noqa: BLE001
+            print(f"[supervisor] error: {type(e).__name__}: {e}", flush=True)
+
+
 def main() -> None:
     global UPSTREAM
     ap = argparse.ArgumentParser()
@@ -279,6 +298,7 @@ def main() -> None:
     a = ap.parse_args()
     UPSTREAM = a.upstream.rstrip("/")
     print(f"loader agent on http://{a.host}:{a.port}  python={PY}  upstream={UPSTREAM}")
+    threading.Thread(target=supervisor, daemon=True).start()
     import uvicorn
 
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")

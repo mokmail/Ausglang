@@ -1022,7 +1022,8 @@ def effective_tools(harness: dict[str, Any], params: dict[str, Any]) -> list[dic
     tools = h2.apply_tool_guidance(tools, harness.get("tool_guidance") or {})
     # c5: every subagent is callable by its own name (models naturally emit that),
     # plus a generic "delegate" escape hatch.
-    for sub in harness.get("subagents") or []:
+    subs = [x for x in (harness.get("subagents") or []) if x.get("name")]
+    for sub in subs:
         if not sub.get("name"):
             continue
         tools.append({
@@ -1033,6 +1034,22 @@ def effective_tools(harness: dict[str, Any], params: dict[str, Any]) -> list[dic
                 "type": "object",
                 "properties": {"task": {"type": "string", "description": "What the subagent should do"}},
                 "required": ["task"],
+            },
+        })
+    if subs:
+        # The system prompt also documents a generic delegate tool; keep it real so
+        # models that follow that prose (rather than the per-name schemas) still work.
+        tools.append({
+            "name": "delegate",
+            "server": "harness",
+            "description": "Delegate a subtask to a named subagent and return its answer.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": [x["name"] for x in subs]},
+                    "task": {"type": "string"},
+                },
+                "required": ["name", "task"],
             },
         })
     return tools
@@ -1643,6 +1660,7 @@ async def api_lessons_reflect(payload: dict = Body(...)) -> dict[str, Any]:
         parsed = json.loads(blob)
     except Exception:
         parsed = {"lesson": raw.strip()[:400], "cue": "", "evidence": "", "confidence": "low"}
+    parsed.setdefault("lesson", raw.strip()[:400])   # stable contract even on bad JSON
     lid = h2.new_id()
     with db() as conn:
         conn.execute(
