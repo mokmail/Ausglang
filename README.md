@@ -72,6 +72,23 @@ because it is driven by `GET /api/server/job`, not by the click that started it.
 
 Deep links: `/?switch=org/model`, `/?menu=models`, `/?panel=model`.
 
+### Memory self-healing
+
+Starting a model on Metal is a two-part bet: the weights must fit **and** the KV pool must be
+big enough to be useful. Both are checked automatically:
+
+1. crash during startup with `Insufficient Memory` → the loader halves the context and retries once;
+2. started, but `/get_server_info` reports a KV pool below `min(4096, ctx)` → the loader stops it,
+   raises `--mem-fraction-static` one notch (+0.15, capped 0.55), caps the context at 8192 and retries;
+3. crash later under load with the same OOM signature → the supervisor restarts at the reduced
+   context with `--max-running-requests 1` instead of looping on the same settings.
+
+The job message and the server card report the resulting pool (`pool 32,974 tok`); a pool under
+4096 tokens is shown as a warning, because a model that only fits 256 tokens answers nothing.
+
+Example from this machine: `HuggingFaceTB/SmolLM3-3B` at ctx 12288 produced a 256-token pool,
+was refitted to mem-fraction 0.45 / ctx 8192, and served 8,069-token prompts in ~11 s.
+
 ### Model loading from inside a container
 
 A Linux container cannot drive Metal, so `POST /api/server/start` returns HTTP 501
@@ -255,6 +272,28 @@ So the default is **12288** and the API rejects anything above **14336** with a 
 On NVIDIA, raise it freely (`--mem-fraction-static 0.85`).
 
 ---
+
+## Rendering
+
+Answers are parsed with **marked** (CommonMark + GFM) and sanitised with **DOMPurify**;
+code is highlighted by **highlight.js**. All three are vendored under `static/vendor/`,
+so rendering works offline and inside the container — no CDN at runtime.
+
+| content | how it renders |
+|---|---|
+| headings, lists, task lists, bold/italic/strike, links, images | native markdown |
+| pipe tables | real `<table>` with alignment, zebra rows, sticky-free styling |
+| fenced code | `hljs` tokens, language label, copy / save buttons |
+| ```` ```mermaid ```` | rendered to inline SVG, sized from its viewBox, dark theme |
+| ```` ```html ```` | sandboxed `<iframe sandbox="allow-scripts">` preview, auto-height via `postMessage` |
+| reasoning | collapsible `details` block; `reasoning_content` deltas and inline ` thinking…</think>` both routed there |
+| empty fences | skipped, so a lazy model cannot draw empty boxes |
+
+Streaming re-renders are throttled to ~8 fps so parsing never blocks token delivery, and a
+final render always runs when the stream ends.
+
+Deep links: `/?chat=<id>` opens a specific chat, `/?menu=models` opens the model switcher,
+`/?switch=org/model` starts a model switch, `/?ask=…` prefills the composer.
 
 ## What the UI gives you
 
