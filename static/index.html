@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SGLang Workbench</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="app">
+
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="logo">S</div>
+      <div class="brand-main">
+        <div class="brand-name">SGLang <span>Workbench</span></div>
+        <div class="brand-sub" id="brandSub">local · Metal</div>
+      </div>
+      <button class="icon-btn" id="paletteBtn" title="Command palette (⌘K)">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h10M4 17h16"/></svg>
+      </button>
+    </div>
+
+    <button class="btn primary block" id="newChat">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg> New chat
+    </button>
+
+    <div class="search">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+      <input id="chatSearch" placeholder="Search chats" autocomplete="off">
+      <kbd>⌘K</kbd>
+    </div>
+
+    <div class="chats" id="chatList"></div>
+
+    <div class="side-foot">
+      <div class="status" id="serverPill" title="SGLang upstream">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">checking…</span>
+      </div>
+      <button class="icon-btn" id="statsBtn" title="Usage stats">
+        <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+      </button>
+      <button class="icon-btn" id="openPanel" title="Model, settings, memory, prompts, MCP (⌘J)">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <button class="icon-btn only-mobile" id="toggleSidebar" title="Chats">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <div class="title-wrap">
+        <h1 id="chatTitle">New chat</h1>
+        <div class="chips">
+          <span class="chip" id="modelChip">—</span>
+          <span class="chip" id="ctxChip">ctx —</span>
+          <span class="chip" id="memChip">memory —</span>
+          <span class="chip" id="harnessChip">harness —</span>
+          <span class="chip" id="jobChip" hidden></span>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="icon-btn" id="forkBtn" title="Fork chat from the last message">
+          <svg viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="18" cy="5" r="2"/><circle cx="12" cy="19" r="2"/><path d="M6 7v3a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7M12 13v4"/></svg>
+        </button>
+        <button class="icon-btn" id="exportBtn" title="Export chat">
+          <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+        </button>
+        <button class="icon-btn" id="themeBtn" title="Toggle theme">
+          <svg viewBox="0 0 24 24"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+        <button class="icon-btn" id="logsBtn" title="Server logs">
+          <svg viewBox="0 0 24 24"><path d="M4 5h16M4 10h10M4 15h16M4 20h10"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <section id="messages"><div class="empty" id="emptyState">
+      <div class="empty-logo">S</div>
+      <h2>Local inference, properly harnessed</h2>
+      <p>Streaming, memory, MCP tools, model switching, attachments, personas and a context window you control — all served by SGLang on this Mac.</p>
+      <div class="suggestions" id="suggestions"></div>
+    </div></section>
+
+    <footer id="composer">
+      <div class="composer-inner">
+        <div class="input-wrap">
+          <div id="attachRow" class="attach-row" hidden></div>
+          <textarea id="input" rows="1" placeholder="Message the model…  (⏎ send · ⇧⏎ newline · ⌘K palette)"></textarea>
+          <div class="input-tools">
+            <button class="mini icon" id="attachBtn" title="Attach a text file">
+              <svg viewBox="0 0 24 24"><path d="M21 12.5l-8.5 8.5a5 5 0 0 1-7-7l8.5-8.5a3.5 3.5 0 0 1 5 5L10 19"/></svg>
+            </button>
+            <input type="file" id="fileInput" multiple hidden accept=".txt,.md,.json,.py,.js,.ts,.csv,.log,.yaml,.yml,.toml,.sh,.html,.css,.sql,.rs,.go,.java,.c,.cpp,.h">
+            <button class="mini" id="thinkToggle" title="Show the reasoning pass (Qwen3-style models)">thinking</button>
+            <button class="mini" id="toolsToggle" title="Allow MCP tool calls">tools <span id="toolCount">0</span></button>
+            <span class="grow"></span>
+            <span class="hint" id="ctxMeter" title="Approximate prompt size vs the context window">ctx 0%</span>
+            <span class="hint" id="streamHint"></span>
+          </div>
+        </div>
+        <button class="btn send" id="sendBtn" title="Send (⏎)">
+          <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-6-7-2z"/></svg>
+        </button>
+      </div>
+      <div class="stats" id="statsBar"></div>
+    </footer>
+  </main>
+
+  <aside id="panel">
+    <div class="panel-head">
+      <div class="tabs" id="panelTabs">
+        <button data-tab="model" class="active">Model</button>
+        <button data-tab="params">Settings</button>
+        <button data-tab="memory">Memory</button>
+        <button data-tab="prompts">Prompts</button>
+        <button data-tab="harness">Harness</button>
+        <button data-tab="mcp">MCP</button>
+      </div>
+      <button class="icon-btn" id="closePanel" title="Close">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+
+    <div class="panel-body">
+      <div class="tab-pane active" data-pane="model">
+        <div class="server-card" id="serverCard">
+          <div class="sc-row"><span class="dot" id="scDot"></span><b id="scModel">—</b></div>
+          <div class="sc-meta" id="scMeta">—</div>
+          <div class="progress" id="loadProgress" hidden><div class="bar" id="loadBar"></div></div>
+          <div class="sc-err" id="loadError" hidden></div>
+          <div class="row" style="margin-top:8px">
+            <button class="btn ghost" id="stopServer">Stop server</button>
+            <button class="btn ghost" id="cancelLoad" hidden>Cancel load</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <select id="modelSource">
+            <option value="cache">Downloaded</option>
+            <option value="curated">Curated</option>
+            <option value="mlx">mlx-community</option>
+            <option value="hf">HuggingFace</option>
+            <option value="local">Local folder</option>
+          </select>
+          <select id="modelTask">
+            <option value="">any task</option>
+            <option value="text-generation">text-generation</option>
+            <option value="text2text-generation">text2text</option>
+          </select>
+        </div>
+        <div class="row">
+          <input id="modelQuery" placeholder="Search models…">
+          <button class="btn" id="modelSearch">Search</button>
+        </div>
+        <div class="list tall" id="modelList"></div>
+
+        <div class="divider"></div>
+        <div class="grid2">
+          <label class="field"><span>Context window</span><input type="number" id="ctxInput" min="1024" step="1024"></label>
+          <label class="field"><span>Mem fraction</span><input type="number" id="memInput" min="0.1" max="0.8" step="0.05"></label>
+          <label class="field"><span>Max running req</span><input type="number" id="reqInput" min="1" max="32" step="1"></label>
+          <label class="field"><span>MLX cache (GB)</span><input type="number" id="cacheInput" min="0.25" max="8" step="0.25"></label>
+        </div>
+        <p class="warn" id="ctxWarn"></p>
+      </div>
+
+      <div class="tab-pane" data-pane="params">
+        <label class="field"><span>Persona</span>
+          <div class="row">
+            <select id="personaSelect"><option value="">— none —</option></select>
+            <button class="btn ghost" id="personaSave" title="Save current prompt + params as a persona">Save</button>
+          </div>
+        </label>
+        <label class="field"><span>System prompt</span>
+          <textarea id="sysPrompt" rows="5"></textarea>
+        </label>
+        <label class="field"><span>Temperature <b id="tempVal"></b></span>
+          <input type="range" id="tempRange" min="0" max="2" step="0.05"></label>
+        <label class="field"><span>Top-p <b id="toppVal"></b></span>
+          <input type="range" id="toppRange" min="0" max="1" step="0.01"></label>
+        <label class="field"><span>Top-k <b id="topkVal"></b></span>
+          <input type="range" id="topkRange" min="0" max="100" step="1"></label>
+        <label class="field"><span>Max tokens <b id="maxtokVal"></b></span>
+          <input type="range" id="maxtokRange" min="32" max="4096" step="32"></label>
+        <label class="field"><span>Repeat penalty <b id="repVal"></b></span>
+          <input type="range" id="repRange" min="1" max="1.5" step="0.01"></label>
+        <label class="field"><span>Tool rounds <b id="roundsVal"></b></span>
+          <input type="range" id="roundsRange" min="0" max="6" step="1"></label>
+        <div class="grid2">
+          <label class="field"><span>Seed</span><input id="seedInput" placeholder="random"></label>
+          <label class="field"><span>Stop sequences</span><input id="stopInput" placeholder="comma,separated"></label>
+        </div>
+        <div class="grid2">
+          <label class="check"><input type="checkbox" id="memEnabled"> Memory injection</label>
+          <label class="check"><input type="checkbox" id="toolsEnabled"> MCP tools</label>
+          <label class="check"><input type="checkbox" id="thinkEnabled"> Thinking pass</label>
+          <label class="check"><input type="checkbox" id="jsonEnabled"> JSON mode</label>
+          <label class="check"><input type="checkbox" id="streamEnabled"> Stream</label>
+          <label class="check"><input type="checkbox" id="autoTitleEnabled"> Auto-title</label>
+        </div>
+        <button class="btn primary block" id="saveParams">Save settings</button>
+      </div>
+
+      <div class="tab-pane" data-pane="memory">
+        <p class="muted">Facts stored here are ranked against each message and injected into the system prompt.</p>
+        <div class="row">
+          <input id="memInputText" placeholder="e.g. The user's NUC is at 192.168.1.57">
+          <button class="btn primary" id="memAdd">Add</button>
+        </div>
+        <div class="list" id="memList"></div>
+      </div>
+
+      <div class="tab-pane" data-pane="prompts">
+        <p class="muted">Reusable instructions. Click one to drop it into the composer.</p>
+        <div class="row"><input id="promptTitle" placeholder="Title"></div>
+        <label class="field"><span>Body</span>
+          <textarea id="promptBody" rows="3" placeholder="e.g. Review this code for race conditions and list findings by severity."></textarea>
+        </label>
+        <button class="btn primary block" id="promptAdd">Save prompt</button>
+        <div class="list" id="promptList"></div>
+      </div>
+
+      <div class="tab-pane" data-pane="harness">
+        <p class="muted">Eight editable components around the model (system prompt, guardrails, memory, tool guidance, subagents, skills, scripts, plugins). The active harness is bound per chat.</p>
+        <div class="row">
+          <select id="harnessSelect"></select>
+          <button class="btn ghost" id="harnessNew" title="New harness">New</button>
+          <button class="btn ghost" id="harnessDup" title="Duplicate">Dup</button>
+          <button class="btn ghost" id="harnessDel" title="Delete">Del</button>
+        </div>
+        <label class="field"><span>System prompt</span><textarea id="hSystem" rows="4"></textarea></label>
+        <label class="field"><span>Guardrails</span><textarea id="hGuard" rows="3"></textarea></label>
+        <label class="field"><span>Memory preamble</span><textarea id="hMemory" rows="2"></textarea></label>
+        <label class="field"><span>Tool guidance — JSON {tool: note}</span><textarea id="hToolGuide" rows="3"></textarea></label>
+        <label class="field"><span>Skills — JSON [{name, body}]</span><textarea id="hSkills" rows="3"></textarea></label>
+        <label class="field"><span>Subagents — JSON [{name, system, description}]</span><textarea id="hSubagents" rows="3"></textarea></label>
+        <label class="field"><span>Scripts — JSON [{name, body}]</span><textarea id="hScripts" rows="2"></textarea></label>
+        <label class="field"><span>Plugins — JSON [{name, body}]</span><textarea id="hPlugins" rows="2"></textarea></label>
+        <div class="grid2">
+          <label class="field"><span>Blocked input (regex, one per line)</span><textarea id="hBlocked" rows="2"></textarea></label>
+          <label class="field"><span>Forbidden output (regex, one per line)</span><textarea id="hForbid" rows="2"></textarea></label>
+        </div>
+        <div class="grid2">
+          <label class="field"><span>Max prompt tokens (0 = off)</span><input type="number" id="hMaxTok" min="0" step="256"></label>
+          <label class="field"><span>Tool allowlist (comma)</span><input id="hAllow" placeholder="empty = all"></label>
+        </div>
+        <div class="grid2">
+          <label class="check"><input type="checkbox" id="hRequireJson"> require JSON output</label>
+          <label class="check"><input type="checkbox" id="hLessons"> inject lessons</label>
+        </div>
+        <div class="row">
+          <button class="btn primary" id="hSave">Save</button>
+          <button class="btn" id="hPreview">Preview</button>
+          <button class="btn ghost" id="hBind">Bind to chat</button>
+        </div>
+        <pre class="log" id="hReport"></pre>
+        <div class="row"><button class="btn ghost" id="hProbe">Probe against this chat</button></div>
+        <pre class="log" id="hProbeOut"></pre>
+        <div class="divider"></div>
+        <p class="muted">Lessons — the experience library injected into context</p>
+        <div class="row">
+          <input id="lessonText" placeholder="Lesson (imperative sentence)">
+          <button class="btn" id="lessonAdd">Add</button>
+          <button class="btn ghost" id="lessonReflect" title="Ask the model to reflect on the last exchange">Reflect</button>
+        </div>
+        <div class="list" id="lessonList"></div>
+      </div>
+
+      <div class="tab-pane" data-pane="mcp">
+        <p class="muted">MCP servers are launched over stdio. Tools appear in the composer and in the model's prompt.</p>
+        <div class="grid2">
+          <label class="field"><span>Name</span><input id="mcpName" placeholder="filesystem"></label>
+          <label class="field"><span>Command</span><input id="mcpCmd" placeholder="npx"></label>
+        </div>
+        <label class="field"><span>Args (space separated)</span><input id="mcpArgs" placeholder="-y @modelcontextprotocol/server-filesystem /Users/kmail"></label>
+        <button class="btn primary block" id="mcpAdd">Add server</button>
+        <div class="list" id="mcpList"></div>
+      </div>
+    </div>
+  </aside>
+
+  <div id="palette" class="modal">
+    <div class="modal-card narrow">
+      <input id="paletteInput" placeholder="Type a command or chat title…" autocomplete="off">
+      <div class="list" id="paletteList"></div>
+    </div>
+  </div>
+
+  <div id="statsModal" class="modal">
+    <div class="modal-card">
+      <div class="modal-head"><h3>Usage</h3>
+        <button class="icon-btn" id="closeStats"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+      </div>
+      <div class="stat-grid" id="statGrid"></div>
+      <div class="bars" id="statBars"></div>
+    </div>
+  </div>
+
+  <div id="logsModal" class="modal">
+    <div class="modal-card">
+      <div class="modal-head"><h3>SGLang server log</h3>
+        <div class="row"><button class="btn ghost" id="refreshLogs">Refresh</button>
+        <button class="icon-btn" id="closeLogs"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+      </div>
+      <pre class="log tall" id="bigLog"></pre>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

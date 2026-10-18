@@ -1,0 +1,92 @@
+# SGLang Workbench — docker compose
+#
+# Default (all operating systems): the workbench runs in a container and talks to
+# an SGLang server you run on the host:
+#
+#     # macOS:   ~/sglang/start-sglang.sh          (Metal / MLX)
+#     # Linux:   python -m sglang.launch_server --model-path ... --port 43440
+#     # Windows: run SGLang in WSL2 the same way
+#     docker compose up -d --build
+#     open http://localhost:8090
+#
+# Linux + NVIDIA: bring SGLang up in its own GPU container instead:
+#
+#     MODEL=Qwen/Qwen3-1.7B docker compose --profile gpu up -d
+#     # then: UPSTREAM=http://sglang:30000 docker compose up -d workbench
+#     # (or set UPSTREAM in .env and run `--profile gpu up -d`)
+#
+# The optional GPU service requires the NVIDIA container toolkit and an
+# NVIDIA GPU; it is impossible on macOS/Windows, which is why it is a profile.
+
+name: sglang-workbench
+
+services:
+  workbench:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sglang-workbench:2.0.0
+    container_name: sglang-workbench
+    ports:
+      - "${WORKBENCH_PORT:-8090}:8090"
+    environment:
+      # Where the SGLang OpenAI API lives. host.docker.internal resolves on
+      # Docker Desktop (macOS/Windows) and, via extra_hosts below, on Linux.
+      UPSTREAM: ${UPSTREAM:-http://host.docker.internal:43440}
+      WORKBENCH_API_KEY: ${WORKBENCH_API_KEY:-}
+      WORKBENCH_CORS_ORIGINS: ${WORKBENCH_CORS_ORIGINS:-*}
+      WORKBENCH_DATA: /data
+      WORKBENCH_ROOT: /app
+      HF_HOME: /hf-cache
+      # Empty => model loading is refused with a clear 501; the host owns the GPU.
+      SGLANG_PYTHON: ${SGLANG_PYTHON:-}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - "${WORKBENCH_DATA_DIR:-./data}:/data"
+      # Mounted read-only so the "Downloaded" model list can be browsed from the
+      # container. Set HF_CACHE_DIR in .env if yours is elsewhere.
+      - "${HF_CACHE_DIR:-/Users/kmail/.cache/huggingface}:/hf-cache:ro"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional: SGLang itself in a container (Linux + NVIDIA only).
+  sglang:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-server
+    profiles: ["gpu"]
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path
+      - ${MODEL:-Qwen/Qwen3-1.7B}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30000"
+      - --mem-fraction-static
+      - ${MEM_FRACTION:-0.85}
+    ports:
+      - "30000:30000"
+    shm_size: "16gb"
+    ipc: host
+    volumes:
+      - "${HF_CACHE_DIR:-/Users/kmail/.cache/huggingface}:/root/.cache/huggingface"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+

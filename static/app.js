@@ -1,0 +1,1295 @@
+/* SGLang Workbench v2 front-end — vanilla JS, no build step */
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+
+const state = {
+  settings: {},
+  chats: [],
+  chatId: null,
+  messages: [],
+  streaming: false,
+  abort: null,
+  tools: [],
+  server: {},
+  job: {},
+  attachments: [],
+  personas: [],
+  stats: null,
+  harnesses: [],
+  harness: null,
+  lessons: [],
+  paletteIndex: 0,
+};
+
+const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function toast(msg, kind = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = msg;
+  $('#toasts').appendChild(el);
+  setTimeout(() => el.remove(), 3800);
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (!r.ok) throw new Error((await r.text()).slice(0, 300) || r.statusText);
+  const ct = r.headers.get('content-type') || '';
+  return ct.includes('json') ? r.json() : r.text();
+}
+
+/* ----------------------------- markdown ----------------------------- */
+const KEYWORDS = /\b(def|class|return|if|else|elif|for|while|try|except|finally|import|from|as|with|lambda|yield|async|await|const|let|var|function|new|this|throw|catch|switch|case|break|continue|True|False|None|null|true|false|undefined|public|private|static|void|int|float|str|bool|list|dict)\b/g;
+
+function highlight(code, lang) {
+  let h = esc(code);
+  h = h.replace(/(&quot;|&#39;|`)(?:(?!\1).)*\1/g, (m) => `<span class="tok-str">${m}</span>`);
+  h = h.replace(/(^|\s)(#|\/\/)(.*)$/gm, '$1<span class="tok-com">$2$3</span>');
+  h = h.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="tok-num">$1</span>');
+  if (['py', 'python', 'js', 'javascript', 'ts', 'tsx', 'rs', 'go', 'java', 'c', 'cpp', 'sh', 'bash', ''].includes(lang)) {
+    h = h.replace(KEYWORDS, '<span class="tok-kw">$1</span>');
+  }
+  return h;
+}
+
+function md(src) {
+  if (!src) return '';
+  const blocks = [];
+  let text = String(src).replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    blocks.push({ lang, code });
+    return `\u0000BLOCK${blocks.length - 1}\u0000`;
+  });
+
+  text = esc(text);
+  text = text.replace(/^###### (.*)$/gm, '<h3>$1</h3>')
+             .replace(/^##### (.*)$/gm, '<h3>$1</h3>')
+             .replace(/^#### (.*)$/gm, '<h3>$1</h3>')
+             .replace(/^### (.*)$/gm, '<h3>$1</h3>')
+             .replace(/^## (.*)$/gm, '<h2>$1</h2>')
+             .replace(/^# (.*)$/gm, '<h1>$1</h1>')
+             .replace(/^\s*---+\s*$/gm, '<hr>')
+             .replace(/^&gt; ?(.*)$/gm, '<blockquote>$1</blockquote>');
+  text = text.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+
+  const out = [];
+  let list = null;
+  for (const line of text.split('\n')) {
+    const m = line.match(/^\s*(?:[-*+]|(\d+)\.)\s+(.*)$/);
+    if (m) {
+      const ordered = !!m[1];
+      if (!list || list.ordered !== ordered) {
+        if (list) out.push(`</${list.ordered ? 'ol' : 'ul'}>`);
+        list = { ordered };
+        out.push(`<${ordered ? 'ol' : 'ul'}>`);
+      }
+      out.push(`<li>${m[2]}</li>`);
+    } else {
+      if (list) { out.push(`</${list.ordered ? 'ol' : 'ul'}>`); list = null; }
+      out.push(line.trim() === '' ? '\u0000P\u0000' : line);
+    }
+  }
+  if (list) out.push(`</${list.ordered ? 'ol' : 'ul'}>`);
+
+  let html = out.join('\n').split(/\u0000P\u0000+/)
+    .map((chunk) => (chunk.trim() ? `<p>${chunk.replace(/\n/g, '<br>')}</p>` : '')).join('');
+
+  html = html.replace(/\u0000BLOCK(\d+)\u0000/g, (_, i) => {
+    const b = blocks[+i];
+    const lang = (b.lang || '').toLowerCase();
+    return `<pre><code data-lang="${esc(lang)}">${highlight(b.code.replace(/\n$/, ''), lang)}</code></pre>`;
+  });
+  return html;
+}
+
+/* ------------------------------ chats ------------------------------ */
+function renderChats() {
+  const q = $('#chatSearch').value.trim().toLowerCase();
+  const list = $('#chatList');
+  const items = state.chats.filter((c) => !q || (c.title || '').toLowerCase().includes(q));
+  list.innerHTML = '';
+  if (!items.length) {
+    list.innerHTML = `<div class="muted" style="padding:10px">${q ? 'No match' : 'No chats yet'}</div>`;
+    return;
+  }
+  for (const c of items) {
+    const el = document.createElement('div');
+    el.className = 'chat-item' + (c.id === state.chatId ? ' active' : '');
+    el.innerHTML = `${c.pinned ? '<span class="pin" title="Pinned">●</span>' : ''}
+      <span class="t"></span><span class="x" title="Pin / unpin">◎</span><span class="x" title="Delete">×</span>`;
+    el.querySelector('.t').textContent = c.title || 'Untitled';
+    el.onclick = (e) => {
+      if (e.target.classList.contains('x')) return;
+      openChat(c.id);
+    };
+    const [pin, del] = el.querySelectorAll('.x');
+    pin.onclick = async (e) => {
+      e.stopPropagation();
+      await api(`/api/chats/${c.id}`, { method: 'PATCH', body: { pinned: !c.pinned } });
+      await loadChats();
+    };
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete "${c.title}"?`)) return;
+      await api(`/api/chats/${c.id}`, { method: 'DELETE' });
+      if (state.chatId === c.id) { state.chatId = null; state.messages = []; renderMessages(); }
+      await loadChats();
+      toast('Chat deleted');
+    };
+    list.appendChild(el);
+  }
+}
+
+async function loadChats() {
+  state.chats = await api('/api/chats');
+  renderChats();
+}
+
+/* ----------------------------- messages ----------------------------- */
+function msgEl(m, idx) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = m.role === 'user' ? 'You' : 'AI';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+
+  if (m.reasoning) {
+    const th = document.createElement('div');
+    th.className = 'think';
+    th.textContent = m.reasoning;
+    bubble.appendChild(th);
+  }
+  if (m.tools?.rounds) {
+    const tl = document.createElement('div');
+    tl.className = 'tool-log';
+    tl.innerHTML = `<div class="th"><span class="tico"></span><b>${m.tools.rounds} tool round(s)</b></div>`;
+    bubble.appendChild(tl);
+  }
+  const body = document.createElement('div');
+  body.className = 'body';
+  if (m.role === 'assistant') body.innerHTML = md(m.content);
+  else body.textContent = m.content;
+  bubble.appendChild(body);
+
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+  const mk = (label, fn, title) => {
+    const b = document.createElement('button');
+    b.className = 'mini';
+    b.textContent = label;
+    if (title) b.title = title;
+    b.onclick = fn;
+    actions.appendChild(b);
+    return b;
+  };
+
+  mk('Copy', async () => { await navigator.clipboard.writeText(m.content); toast('Copied'); });
+  if (m.role === 'user' && m.id && !m.id.startsWith('tmp-')) {
+    mk('Edit', () => startEdit(m, body, actions));
+  }
+  if (!m.id.startsWith('tmp-')) {
+    mk('Fork here', async () => {
+      const r = await api(`/api/chats/${state.chatId}/fork`, { method: 'POST', body: { message_id: m.id } });
+      await loadChats();
+      await openChat(r.id);
+      toast(`Forked (${r.messages} messages)`);
+    });
+    mk('Delete', async () => {
+      if (!confirm('Delete this message?')) return;
+      await api(`/api/messages/${m.id}`, { method: 'DELETE' });
+      await openChat(state.chatId);
+    });
+  }
+  if (m.role === 'assistant' && idx === state.messages.length - 1) {
+    mk('Regenerate', regenerate);
+  }
+  if (m.meta?.usage?.completion_tokens) {
+    const s = document.createElement('span');
+    s.className = 'mini';
+    s.style.cursor = 'default';
+    s.textContent = `${m.meta.usage.prompt_tokens}→${m.meta.usage.completion_tokens} tok · ${m.meta.elapsed_s}s`;
+    actions.appendChild(s);
+  }
+  if (m.edited) {
+    const e = document.createElement('span');
+    e.className = 'edited';
+    e.textContent = 'edited';
+    actions.appendChild(e);
+  }
+  bubble.appendChild(actions);
+  wrap.append(avatar, bubble);
+  return wrap;
+}
+
+function startEdit(m, body, actions) {
+  const box = document.createElement('textarea');
+  box.className = 'edit-box';
+  box.value = m.content;
+  body.replaceWith(box);
+  box.focus();
+  const row = document.createElement('div');
+  row.className = 'msg-actions';
+  const save = document.createElement('button');
+  save.className = 'mini on';
+  save.textContent = 'Save';
+  save.onclick = async () => {
+    await api(`/api/messages/${m.id}`, { method: 'PATCH', body: { content: box.value } });
+    toast('Message updated — regenerate to apply');
+    await openChat(state.chatId);
+  };
+  const cancel = document.createElement('button');
+  cancel.className = 'mini';
+  cancel.textContent = 'Cancel';
+  cancel.onclick = () => openChat(state.chatId);
+  row.append(save, cancel);
+  actions.replaceWith(row);
+}
+
+function renderMessages() {
+  const box = $('#messages');
+  box.innerHTML = '';
+  if (!state.messages.length) {
+    box.appendChild(emptyState());
+    updateCtxMeter();
+    return;
+  }
+  const thread = document.createElement('div');
+  thread.className = 'thread';
+  state.messages.forEach((m, i) => thread.appendChild(msgEl(m, i)));
+  box.appendChild(thread);
+  box.scrollTop = box.scrollHeight;
+  updateCtxMeter();
+}
+
+function emptyState() {
+  const tpl = document.createElement('div');
+  tpl.innerHTML = `
+    <div class="empty">
+      <div class="empty-logo">S</div>
+      <h2>Local inference, properly harnessed</h2>
+      <p>Streaming, memory, MCP tools, model switching, attachments, personas and a context window you control — all served by SGLang on this Mac.</p>
+      <div class="suggestions">
+        <button class="sug">Explain what the memory store injects into each prompt</button>
+        <button class="sug">Which context window can this machine actually handle, and why?</button>
+        <button class="sug">Write a Python function that tails a log and flags OOM crashes</button>
+        <button class="sug">Summarise what MCP is in five lines</button>
+      </div>
+    </div>`;
+  tpl.querySelectorAll('.sug').forEach((b) => {
+    b.onclick = () => { $('#input').value = b.textContent; autosize(); $('#input').focus(); };
+  });
+  return tpl.firstElementChild;
+}
+
+/* --------------------------- chat flow --------------------------- */
+async function openChat(id) {
+  state.chatId = id;
+  state.messages = await api(`/api/chats/${id}/messages`);
+  const chat = state.chats.find((c) => c.id === id);
+  $('#chatTitle').textContent = chat?.title || 'Chat';
+  renderMessages();
+  renderChats();
+  $('#sidebar').classList.remove('open');
+}
+
+async function newChat() {
+  const c = await api('/api/chats', { method: 'POST', body: {} });
+  state.chatId = c.id;
+  state.messages = [];
+  $('#chatTitle').textContent = 'New chat';
+  renderMessages();
+  await loadChats();
+  $('#input').focus();
+}
+
+function addLocal(role, content) {
+  const m = { id: 'tmp-' + Math.random(), role, content };
+  state.messages.push(m);
+  const box = $('#messages');
+  if (!box.querySelector('.thread')) {
+    box.innerHTML = '';
+    const t = document.createElement('div');
+    t.className = 'thread';
+    box.appendChild(t);
+  }
+  const el = msgEl(m, state.messages.length - 1);
+  box.querySelector('.thread').appendChild(el);
+  box.scrollTop = box.scrollHeight;
+  return { m, el };
+}
+
+function autosize() {
+  const t = $('#input');
+  t.style.height = 'auto';
+  t.style.height = Math.min(t.scrollHeight, 220) + 'px';
+  updateCtxMeter();
+}
+
+function updateCtxMeter() {
+  const ctx = Number(state.settings.context_length) || 12288;
+  const chars = state.messages.reduce((a, m) => a + (m.content || '').length, 0) +
+                (state.settings.system_prompt || '').length + $('#input').value.length +
+                state.attachments.reduce((a, f) => a + f.text.length, 0);
+  const tokens = Math.ceil(chars / 4);
+  const pct = Math.min(999, Math.round((tokens / ctx) * 100));
+  const el = $('#ctxMeter');
+  el.textContent = `ctx ${pct}%`;
+  el.style.color = pct > 95 ? 'var(--danger)' : pct > 75 ? 'var(--warn)' : 'var(--fg-mute)';
+  el.title = `~${tokens} prompt tokens of ${ctx}`;
+}
+
+async function sendMessage(textOverride) {
+  if (state.streaming) return;
+  const text = (textOverride ?? $('#input').value).trim();
+  if (!text) return;
+  if (!state.chatId) await newChat();
+
+  $('#input').value = '';
+  autosize();
+  addLocal('user', text + (state.attachments.length ? `\n\n[${state.attachments.length} attachment(s)]` : ''));
+  const attachments = [...state.attachments];
+  state.attachments = [];
+  renderAttachments();
+
+  const assistant = { id: 'tmp-' + Math.random(), role: 'assistant', content: '', reasoning: '' };
+  state.messages.push(assistant);
+  const aEl = msgEl(assistant, state.messages.length - 1);
+  $('#messages .thread').appendChild(aEl);
+  const bodyEl = aEl.querySelector('.body');
+  bodyEl.innerHTML = '<span class="cursor"></span>';
+  const thinkEl = document.createElement('div');
+  thinkEl.className = 'think';
+  thinkEl.style.display = 'none';
+  aEl.querySelector('.bubble').prepend(thinkEl);
+
+  state.streaming = true;
+  state.abort = new AbortController();
+  setSendState();
+  const t0 = performance.now();
+  let chars = 0;
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: state.abort.signal,
+      body: JSON.stringify({ chat_id: state.chatId, message: text, attachments }),
+    });
+    if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for (const part of parts) {
+        const ev = /^event: (.*)$/m.exec(part)?.[1];
+        const dataRaw = /^data: (.*)$/m.exec(part)?.[1];
+        if (!ev || !dataRaw) continue;
+        const data = JSON.parse(dataRaw);
+        if (ev === 'delta') {
+          assistant.content += data.text;
+          chars += data.text.length;
+          bodyEl.innerHTML = md(assistant.content) + '<span class="cursor"></span>';
+          const secs = Math.max(0.001, (performance.now() - t0) / 1000);
+          $('#streamHint').textContent = `~${Math.round(chars / 4 / secs)} tok/s`;
+          $('#messages').scrollTop = $('#messages').scrollHeight;
+        } else if (ev === 'reasoning') {
+          assistant.reasoning += data.text;
+          thinkEl.style.display = 'block';
+          thinkEl.textContent = assistant.reasoning;
+        } else if (ev === 'tool') {
+          if (data.state === 'running') {
+            const tl = document.createElement('div');
+            tl.className = 'tool-log';
+            tl.innerHTML = `<div class="th"><span class="tico"></span><b>${esc(data.tool)}</b> · ${esc(data.server)} · running…</div><pre></pre>`;
+            tl.querySelector('pre').textContent = JSON.stringify(data.arguments, null, 2);
+            aEl.querySelector('.bubble').appendChild(tl);
+          } else {
+            const last = [...aEl.querySelectorAll('.tool-log')].pop();
+            if (last) {
+              last.querySelector('.th').innerHTML = `<span class="tico"></span><b>${esc(data.tool)}</b> · ${esc(data.server)} · done`;
+              last.querySelector('pre').textContent = data.result || '(no output)';
+            }
+          }
+          $('#messages').scrollTop = $('#messages').scrollHeight;
+        } else if (ev === 'error') {
+          toast(data.message, 'err');
+          assistant.content += `\n\n**Error:** ${data.message}`;
+          bodyEl.innerHTML = md(assistant.content);
+        } else if (ev === 'done') {
+          assistant.content = data.text || assistant.content;
+          assistant.meta = { usage: data.usage, elapsed_s: data.elapsed_s };
+          bodyEl.innerHTML = md(assistant.content);
+          $('#statsBar').textContent =
+            `${data.usage?.prompt_tokens ?? '?'} prompt · ${data.usage?.completion_tokens ?? '?'} completion · ${data.elapsed_s}s` +
+            (data.rounds ? ` · ${data.rounds} tool round(s)` : '');
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      assistant.content += '\n\n_[stopped]_';
+      bodyEl.innerHTML = md(assistant.content);
+    } else {
+      toast(e.message, 'err');
+      assistant.content += `\n\n**Error:** ${e.message}`;
+      bodyEl.innerHTML = md(assistant.content);
+    }
+  } finally {
+    state.streaming = false;
+    state.abort = null;
+    setSendState();
+    $('#streamHint').textContent = '';
+    await openChat(state.chatId);
+    await loadChats();
+  }
+}
+
+async function regenerate() {
+  if (state.streaming || !state.chatId) return;
+  state.streaming = true;
+  state.abort = new AbortController();
+  setSendState();
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: state.abort.signal,
+      body: JSON.stringify({ chat_id: state.chatId, regenerate: true }),
+    });
+    await res.text();
+  } catch (e) {
+    if (e.name !== 'AbortError') toast(e.message, 'err');
+  } finally {
+    state.streaming = false;
+    state.abort = null;
+    setSendState();
+    await openChat(state.chatId);
+  }
+}
+
+function setSendState() {
+  const b = $('#sendBtn');
+  b.classList.toggle('stop', state.streaming);
+  b.innerHTML = state.streaming
+    ? '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>'
+    : '<svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-6-7-2z"/></svg>';
+}
+
+/* --------------------------- attachments --------------------------- */
+function renderAttachments() {
+  const row = $('#attachRow');
+  row.innerHTML = '';
+  if (!state.attachments.length) { row.hidden = true; updateCtxMeter(); return; }
+  row.hidden = false;
+  state.attachments.forEach((f, i) => {
+    const chip = document.createElement('span');
+    chip.className = 'file-chip';
+    chip.innerHTML = `<span></span><button title="Remove">×</button>`;
+    chip.querySelector('span').textContent = `${f.name} (${Math.round(f.text.length / 1024)} KB)`;
+    chip.querySelector('button').onclick = () => {
+      state.attachments.splice(i, 1);
+      renderAttachments();
+    };
+    row.appendChild(chip);
+  });
+  updateCtxMeter();
+}
+
+async function addFiles(files) {
+  for (const file of files) {
+    if (file.size > 400 * 1024) { toast(`${file.name} is too large (400 KB max)`, 'err'); continue; }
+    const text = await file.text();
+    state.attachments.push({ name: file.name, text });
+  }
+  renderAttachments();
+}
+
+/* ----------------------------- state ----------------------------- */
+const JOB_ACTIVE = ['preparing', 'downloading', 'starting', 'stopping'];
+
+async function refreshState() {
+  try {
+    const s = await api('/api/state');
+    state.settings = s.settings;
+    state.tools = s.tools || [];
+    state.server = s.server || {};
+    state.job = s.job || {};
+    const up = !!s.server?.up;
+    const jobActive = JOB_ACTIVE.includes(state.job.state);
+
+    $('#statusDot').className = 'dot ' + (jobActive ? 'busy' : up ? 'on' : 'off');
+    $('#statusText').textContent = jobActive
+      ? `${state.job.state} ${state.job.progress ? Math.round(state.job.progress) + '%' : ''}`.trim()
+      : up ? `${(state.settings.model || '').split('/').pop()} · up` : 'server down';
+    $('#brandSub').textContent = up
+      ? `local · Metal · ${(s.server?.context_length || state.settings.context_length).toLocaleString()} ctx`
+      : 'local · Metal · offline';
+
+    $('#modelChip').textContent = s.server?.model || s.settings.model;
+    $('#ctxChip').textContent = `ctx ${Number(s.server?.context_length || s.settings.context_length).toLocaleString()}`;
+    $('#memChip').textContent = s.settings.memory_enabled ? 'memory on' : 'memory off';
+    if (s.harness && $('#harnessChip')) $('#harnessChip').textContent = `harness ${s.harness.name}`;
+    $('#memChip').className = 'chip' + (s.settings.memory_enabled ? ' on' : '');
+    $('#toolCount').textContent = state.tools.length;
+    $('#toolsToggle').classList.toggle('on', !!s.settings.tools_enabled);
+    $('#thinkToggle').classList.toggle('on', !!s.settings.enable_thinking);
+    $('#jobChip').hidden = !jobActive;
+    if (jobActive) {
+      $('#jobChip').className = 'chip busy';
+      $('#jobChip').textContent = `${state.job.state} ${Math.round(state.job.progress || 0)}%`;
+    }
+    renderServerCard();
+    applySettingsToForm();
+  } catch (e) {
+    $('#statusDot').className = 'dot off';
+    $('#statusText').textContent = 'workbench offline';
+  }
+}
+
+function renderServerCard() {
+  const j = state.job || {};
+  const s = state.server || {};
+  const up = !!s.up;
+  $('#scDot').className = 'dot ' + (JOB_ACTIVE.includes(j.state) ? 'busy' : up ? 'on' : 'off');
+  $('#scModel').textContent = s.model || state.settings.model || '—';
+  $('#scMeta').textContent = up
+    ? `ctx ${Number(s.context_length || 0).toLocaleString()} · pool ${Number(s.max_total_num_tokens || 0).toLocaleString()} tok · RSS ${s.rss_gb ?? '?'} GB`
+    : (j.state !== 'idle' ? `${j.state}: ${j.message || ''}` : 'server not running');
+
+  const prog = $('#loadProgress');
+  const bar = $('#loadBar');
+  const active = JOB_ACTIVE.includes(j.state);
+  prog.hidden = !active;
+  bar.style.width = `${Math.round(j.progress || 0)}%`;
+
+  const err = $('#loadError');
+  if (j.state === 'failed' && j.error) { err.hidden = false; err.textContent = j.error; }
+  else err.hidden = true;
+
+  $('#cancelLoad').hidden = !active;
+  $('#stopServer').disabled = !up && !active;
+}
+
+function applySettingsToForm() {
+  const s = state.settings;
+  $('#ctxInput').value = s.context_length;
+  $('#memInput').value = s.mem_fraction_static;
+  $('#reqInput').value = s.max_running_requests;
+  $('#cacheInput').value = s.mlx_cache_gb;
+  $('#sysPrompt').value = s.system_prompt || '';
+  $('#tempRange').value = s.temperature; $('#tempVal').textContent = s.temperature;
+  $('#toppRange').value = s.top_p; $('#toppVal').textContent = s.top_p;
+  $('#topkRange').value = s.top_k; $('#topkVal').textContent = s.top_k;
+  $('#maxtokRange').value = s.max_tokens; $('#maxtokVal').textContent = s.max_tokens;
+  $('#repRange').value = s.repeat_penalty; $('#repVal').textContent = s.repeat_penalty;
+  $('#roundsRange').value = s.max_tool_rounds; $('#roundsVal').textContent = s.max_tool_rounds;
+  $('#seedInput').value = s.seed ?? '';
+  $('#stopInput').value = Array.isArray(s.stop) ? s.stop.join(',') : (s.stop || '');
+  $('#memEnabled').checked = !!s.memory_enabled;
+  $('#toolsEnabled').checked = !!s.tools_enabled;
+  $('#thinkEnabled').checked = !!s.enable_thinking;
+  $('#jsonEnabled').checked = !!s.json_mode;
+  $('#streamEnabled').checked = !!s.stream;
+  $('#autoTitleEnabled').checked = !!s.auto_title;
+  updateCtxWarn();
+}
+
+function updateCtxWarn() {
+  const v = +$('#ctxInput').value;
+  const w = $('#ctxWarn');
+  if (v > 14336) w.textContent = '⚠ The API refuses anything above 14336: 12288 is tested, 16384 dies with a Metal OOM.';
+  else if (v > 12288) w.textContent = '⚠ 12288 is the tested-safe maximum on this Mac.';
+  else w.textContent = '';
+}
+
+/* ---------------------------- model tab ---------------------------- */
+async function loadModels() {
+  const src = $('#modelSource').value;
+  const q = $('#modelQuery').value.trim();
+  const task = $('#modelTask').value;
+  const list = $('#modelList');
+  list.innerHTML = '<div class="muted" style="padding:8px">loading…</div>';
+  try {
+    const models = await api(`/api/models?source=${src}&q=${encodeURIComponent(q)}&task=${encodeURIComponent(task)}`);
+    list.innerHTML = '';
+    if (!models.length) { list.innerHTML = '<div class="muted" style="padding:8px">nothing found</div>'; return; }
+    for (const m of models) {
+      const el = document.createElement('div');
+      el.className = 'item' + (m.id === state.settings.model ? ' active' : '');
+      const left = document.createElement('div');
+      left.style.minWidth = '0';
+      left.innerHTML = `<div class="mid"></div><div class="meta"></div>`;
+      left.querySelector('.mid').textContent = m.id;
+      const bits = [];
+      if (m.size_gb) bits.push(`${m.size_gb} GB`);
+      if (m.downloads) bits.push(`${m.downloads.toLocaleString()} dl`);
+      if (m.gated) bits.push('gated');
+      left.querySelector('.meta').textContent = bits.join(' · ') || m.source;
+      const right = document.createElement('div');
+      right.className = 'row';
+      right.style.flex = '0 0 auto';
+      right.innerHTML = `<span class="badge ${m.downloaded ? 'dl' : ''}">${m.downloaded ? 'local' : 'remote'}</span>
+        <button class="mini">Load</button>`;
+      right.querySelector('button').onclick = (e) => {
+        e.stopPropagation();
+        startServer(m.id);
+      };
+      el.append(left, right);
+      el.onclick = () => {
+        state.settings.model = m.id;
+        $('#modelChip').textContent = m.id;
+        toast(`Selected ${m.id}`);
+        loadModels();
+      };
+      list.appendChild(el);
+    }
+  } catch (e) {
+    list.innerHTML = `<div class="muted" style="padding:8px">${esc(e.message)}</div>`;
+  }
+}
+
+async function startServer(model) {
+  const payload = {
+    model,
+    context_length: +$('#ctxInput').value,
+    mem_fraction_static: +$('#memInput').value,
+    max_running_requests: +$('#reqInput').value,
+    mlx_cache_gb: +$('#cacheInput').value,
+  };
+  try {
+    await api('/api/server/start', { method: 'POST', body: payload });
+    toast(`Loading ${model}…`);
+    pollJob();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function pollJob() {
+  let guard = 0;
+  while (guard++ < 400) {
+    await refreshState();
+    if (!JOB_ACTIVE.includes(state.job.state)) {
+      if (state.job.state === 'ready') { toast(`${state.job.model} ready`); loadModels(); }
+      if (state.job.state === 'failed') toast('Load failed — see the error in the model tab', 'err');
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+
+/* ---------------------------- memory ---------------------------- */
+async function loadMemory() {
+  const rows = await api('/api/memory');
+  const list = $('#memList');
+  list.innerHTML = '';
+  if (!rows.length) { list.innerHTML = '<div class="muted" style="padding:8px">No memories yet</div>'; return; }
+  for (const r of rows) {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = `<span></span><button class="mini">delete</button>`;
+    el.firstElementChild.textContent = r.text;
+    el.querySelector('button').onclick = async () => {
+      await api(`/api/memory/${r.id}`, { method: 'DELETE' });
+      loadMemory(); toast('Memory removed');
+    };
+    list.appendChild(el);
+  }
+}
+
+/* ---------------------------- prompts ---------------------------- */
+async function loadPrompts() {
+  const rows = await api('/api/prompts');
+  const list = $('#promptList');
+  list.innerHTML = '';
+  if (!rows.length) { list.innerHTML = '<div class="muted" style="padding:8px">No prompts saved</div>'; return; }
+  for (const r of rows) {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = `<div><div class="mid"></div><div class="meta"></div></div>
+      <div class="row" style="flex:0 0 auto"><button class="mini u">use</button><button class="mini d">×</button></div>`;
+    el.querySelector('.mid').textContent = r.title;
+    el.querySelector('.meta').textContent = r.body.slice(0, 60);
+    el.querySelector('.u').onclick = () => {
+      $('#input').value = r.body;
+      autosize();
+      $('#input').focus();
+      toast('Prompt inserted');
+    };
+    el.querySelector('.d').onclick = async () => {
+      await api(`/api/prompts/${r.id}`, { method: 'DELETE' });
+      loadPrompts();
+    };
+    list.appendChild(el);
+  }
+}
+
+/* ------------------------------ MCP ------------------------------ */
+async function loadMcp() {
+  const rows = await api('/api/mcp/servers');
+  const list = $('#mcpList');
+  list.innerHTML = '';
+  if (!rows.length) { list.innerHTML = '<div class="muted" style="padding:8px">No MCP servers configured</div>'; return; }
+  for (const r of rows) {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = `<div><div class="mid"></div><div class="meta"></div></div>
+      <div class="row" style="flex:0 0 auto">
+        <button class="mini t">${r.enabled === false ? 'off' : 'on'}</button>
+        <button class="mini c">connect</button><button class="mini d">×</button>
+      </div>`;
+    el.querySelector('.mid').textContent = r.name;
+    el.querySelector('.meta').textContent = r.connected
+      ? `${r.tools.length} tools: ${r.tools.join(', ')}` : r.command;
+    el.querySelector('.t').onclick = async () => {
+      await api(`/api/mcp/servers/${encodeURIComponent(r.name)}`, {
+        method: 'PATCH', body: { enabled: r.enabled === false },
+      });
+      loadMcp(); refreshState();
+    };
+    el.querySelector('.c').onclick = async () => {
+      try {
+        const res = await api(`/api/mcp/servers/${encodeURIComponent(r.name)}/connect`, { method: 'POST', body: {} });
+        toast(`${r.name}: ${res.tools.length} tools`);
+        loadMcp(); refreshState();
+      } catch (e) { toast(e.message, 'err'); }
+    };
+    el.querySelector('.d').onclick = async () => {
+      await api(`/api/mcp/servers/${encodeURIComponent(r.name)}`, { method: 'DELETE' });
+      loadMcp(); refreshState();
+    };
+    list.appendChild(el);
+  }
+}
+
+/* --------------------------- personas --------------------------- */
+async function loadPersonas() {
+  state.personas = await api('/api/personas');
+  const sel = $('#personaSelect');
+  sel.innerHTML = '<option value="">— none —</option>';
+  for (const p of state.personas) {
+    const o = document.createElement('option');
+    o.value = p.id;
+    o.textContent = p.name;
+    sel.appendChild(o);
+  }
+  if (state.settings.persona) sel.value = state.settings.persona;
+}
+
+
+/* --------------------------- harness (c1..c8) --------------------------- */
+const JSON_FIELDS = {
+  hToolGuide: 'tool_guidance', hSkills: 'skills', hSubagents: 'subagents',
+  hScripts: 'scripts', hPlugins: 'plugins',
+};
+
+async function loadHarnesses() {
+  const data = await api('/api/harnesses');
+  state.harnesses = data.harnesses || [];
+  const sel = $('#harnessSelect');
+  const current = sel.value || (state.harness && state.harness.id);
+  sel.innerHTML = '';
+  for (const h of state.harnesses) {
+    const o = document.createElement('option');
+    o.value = h.id;
+    o.textContent = h.name;
+    sel.appendChild(o);
+  }
+  if (current && state.harnesses.some((h) => h.id === current)) sel.value = current;
+  fillHarnessForm();
+}
+
+function currentHarness() {
+  const id = $('#harnessSelect').value;
+  return state.harnesses.find((h) => h.id === id) || state.harnesses[0] || {};
+}
+
+function fillHarnessForm() {
+  const h = currentHarness();
+  state.harness = h;
+  const j = (v) => JSON.stringify(v ?? (Array.isArray(v) ? [] : {}), null, 1);
+  $('#hSystem').value = h.system_prompt || '';
+  $('#hGuard').value = h.guardrails || '';
+  $('#hMemory').value = h.memory || '';
+  $('#hToolGuide').value = j(h.tool_guidance || {});
+  $('#hSkills').value = j(h.skills || []);
+  $('#hSubagents').value = j(h.subagents || []);
+  $('#hScripts').value = j(h.scripts || []);
+  $('#hPlugins').value = j(h.plugins || []);
+  const rules = h.rules || {};
+  $('#hBlocked').value = (rules.blocked_input || []).join('\n');
+  $('#hForbid').value = (rules.forbid_output || []).join('\n');
+  $('#hMaxTok').value = rules.max_prompt_tokens || 0;
+  $('#hAllow').value = (rules.tool_allowlist || []).join(',');
+  $('#hRequireJson').checked = !!rules.require_json;
+  $('#hLessons').checked = rules.include_lessons !== false;
+  $('#hReport').textContent = `${h.name} · ${JSON.stringify(h).length} chars of definition`;
+}
+
+function parseField(id) {
+  const raw = $('#' + id).value.trim();
+  if (!raw) return JSON_FIELDS[id] === 'tool_guidance' ? {} : [];
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`${id}: invalid JSON — ${e.message}`);
+  }
+}
+
+function harnessPayload() {
+  const payload = {
+    name: currentHarness().name,
+    system_prompt: $('#hSystem').value,
+    guardrails: $('#hGuard').value,
+    memory: $('#hMemory').value,
+    tool_guidance: parseField('hToolGuide'),
+    skills: parseField('hSkills'),
+    subagents: parseField('hSubagents'),
+    scripts: parseField('hScripts'),
+    plugins: parseField('hPlugins'),
+    rules: {
+      blocked_input: $('#hBlocked').value.split('\n').map((x) => x.trim()).filter(Boolean),
+      forbid_output: $('#hForbid').value.split('\n').map((x) => x.trim()).filter(Boolean),
+      require_json: $('#hRequireJson').checked,
+      max_prompt_tokens: +$('#hMaxTok').value || 0,
+      tool_allowlist: $('#hAllow').value.split(',').map((x) => x.trim()).filter(Boolean),
+      include_lessons: $('#hLessons').checked,
+    },
+  };
+  return payload;
+}
+
+async function saveHarness() {
+  const h = currentHarness();
+  if (!h.id) return toast('No harness selected', 'err');
+  try {
+    await api(`/api/harnesses/${h.id}`, { method: 'PATCH', body: harnessPayload() });
+    toast('Harness saved');
+    await loadHarnesses();
+    refreshState();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function previewHarness() {
+  const h = currentHarness();
+  const q = $('#input').value.trim();
+  const r = await api(`/api/harnesses/${h.id}/preview?q=${encodeURIComponent(q)}`);
+  const rows = Object.entries(r.report).filter(([k]) => k !== 'total')
+    .map(([k, v]) => `${k}: ${v.tokens} tok`).join(' · ');
+  $('#hReport').textContent = `${rows}\n\n${r.system}`;
+}
+
+async function probeHarness() {
+  if (!state.chatId) return toast('Open a chat first', 'err');
+  const h = currentHarness();
+  $('#hProbeOut').textContent = 'probing…';
+  try {
+    const r = await api('/api/harness/probe', { method: 'POST', body: { chat_id: state.chatId, harness_id: h.id } });
+    const g = r.guardrails && r.guardrails.length ? `\n\nguardrail flags: ${r.guardrails.join('; ')}` : '';
+    $('#hProbeOut').textContent = `[${r.harness}] ${r.elapsed_s}s · ${r.prompt_tokens ?? '?'} prompt tok${g}\n\n${r.text}`;
+  } catch (e) { $('#hProbeOut').textContent = e.message; }
+}
+
+async function bindHarness() {
+  if (!state.chatId) return toast('Open a chat first', 'err');
+  const h = currentHarness();
+  await api(`/api/chats/${state.chatId}/harness`, { method: 'POST', body: { harness_id: h.id } });
+  toast(`Chat bound to ${h.name}`);
+  refreshState();
+}
+
+async function loadLessons() {
+  state.lessons = await api('/api/lessons');
+  const list = $('#lessonList');
+  list.innerHTML = '';
+  if (!state.lessons.length) { list.innerHTML = '<div class="muted" style="padding:8px">No lessons yet</div>'; return; }
+  for (const l of state.lessons) {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = `<div><div class="mid"></div><div class="meta"></div></div><button class="mini">×</button>`;
+    el.querySelector('.mid').textContent = l.lesson;
+    el.querySelector('.meta').textContent = `${l.domain} · ${l.confidence || '?'}${l.cue ? ' · ' + l.cue : ''}`;
+    el.querySelector('button').onclick = async () => {
+      await api(`/api/lessons/${l.id}`, { method: 'DELETE' });
+      loadLessons();
+    };
+    list.appendChild(el);
+  }
+}
+
+/* ----------------------------- modals ----------------------------- */
+async function showLogs() {
+  const lines = await api('/api/server/logs?tail=400');
+  $('#bigLog').textContent = lines.join('\n') || '(empty)';
+  $('#logsModal').classList.add('open');
+  $('#bigLog').scrollTop = $('#bigLog').scrollHeight;
+}
+
+async function showStats() {
+  const s = await api('/api/stats');
+  state.stats = s;
+  $('#statGrid').innerHTML = `
+    <div class="stat"><div class="v">${s.chats}</div><div class="l">chats</div></div>
+    <div class="stat"><div class="v">${s.messages}</div><div class="l">messages</div></div>
+    <div class="stat"><div class="v">${s.prompt_tokens.toLocaleString()}</div><div class="l">prompt tok</div></div>
+    <div class="stat"><div class="v">${s.completion_tokens.toLocaleString()}</div><div class="l">completion tok</div></div>`;
+  const max = Math.max(1, ...s.days.map((d) => d.prompt + d.completion));
+  $('#statBars').innerHTML = s.days.slice(-21).map((d) => {
+    const total = d.prompt + d.completion;
+    return `<div class="bar-row"><span>${d.date}</span>
+      <span class="bar-track"><span class="bar-fill" style="width:${(total / max) * 100}%"></span></span>
+      <span>${total.toLocaleString()} tok · ${d.messages} msg</span></div>`;
+  }).join('') || '<div class="muted">No usage yet</div>';
+  $('#statsModal').classList.add('open');
+}
+
+/* --------------------------- command palette --------------------------- */
+function paletteItems() {
+  const cmds = [
+    { label: 'New chat', kind: 'action', run: newChat },
+    { label: 'Open model manager', kind: 'action', run: () => openPanel('model') },
+    { label: 'Open settings', kind: 'action', run: () => openPanel('params') },
+    { label: 'Open memory', kind: 'action', run: () => openPanel('memory') },
+    { label: 'Open prompts', kind: 'action', run: () => openPanel('prompts') },
+    { label: 'Open MCP servers', kind: 'action', run: () => openPanel('mcp') },
+    { label: 'Open harness editor', kind: 'action', run: () => openPanel('harness') },
+    { label: 'Usage stats', kind: 'action', run: showStats },
+    { label: 'Server logs', kind: 'action', run: showLogs },
+    { label: 'Export chat', kind: 'action', run: exportChat },
+    { label: 'Toggle theme', kind: 'action', run: toggleTheme },
+    { label: 'API docs (Swagger)', kind: 'link', run: () => window.open('/docs', '_blank') },
+    ...state.chats.slice(0, 30).map((c) => ({
+      label: c.title || 'Untitled', kind: 'chat', run: () => openChat(c.id),
+    })),
+  ];
+  const q = $('#paletteInput').value.trim().toLowerCase();
+  return cmds.filter((c) => !q || c.label.toLowerCase().includes(q));
+}
+
+function renderPalette() {
+  const items = paletteItems();
+  state.paletteIndex = Math.min(state.paletteIndex, Math.max(0, items.length - 1));
+  const list = $('#paletteList');
+  list.innerHTML = '';
+  items.forEach((it, i) => {
+    const el = document.createElement('div');
+    el.className = 'pal-item' + (i === state.paletteIndex ? ' sel' : '');
+    el.innerHTML = `<span></span><span class="k">${it.kind}</span>`;
+    el.firstElementChild.textContent = it.label;
+    el.onclick = () => { closePalette(); it.run(); };
+    list.appendChild(el);
+  });
+}
+
+function openPalette() {
+  $('#palette').classList.add('open');
+  $('#paletteInput').value = '';
+  state.paletteIndex = 0;
+  renderPalette();
+  $('#paletteInput').focus();
+}
+
+function closePalette() { $('#palette').classList.remove('open'); }
+
+/* ------------------------------ wiring ------------------------------ */
+function openPanel(tab = 'model') {
+  $('#panel').classList.add('open');
+  $$('#panelTabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  $$('.tab-pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
+  if (tab === 'model') loadModels();
+  if (tab === 'memory') loadMemory();
+  if (tab === 'prompts') loadPrompts();
+  if (tab === 'mcp') loadMcp();
+  if (tab === 'params') loadPersonas();
+  if (tab === 'harness') { loadHarnesses(); loadLessons(); }
+}
+
+function exportChat() {
+  if (!state.chatId) return toast('No chat to export', 'err');
+  window.location = `/api/chats/${state.chatId}/export?fmt=md`;
+}
+
+async function toggleTheme() {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  await api('/api/settings', { method: 'POST', body: { theme: next } });
+}
+
+function bind() {
+  $('#newChat').onclick = newChat;
+  $('#chatSearch').oninput = renderChats;
+  $('#sendBtn').onclick = () => (state.streaming ? state.abort?.abort() : sendMessage());
+  $('#input').addEventListener('input', autosize);
+  $('#input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+
+  $('#attachBtn').onclick = () => $('#fileInput').click();
+  $('#fileInput').onchange = async (e) => { await addFiles([...e.target.files]); e.target.value = ''; };
+  $('#input').addEventListener('dragover', (e) => e.preventDefault());
+  $('#input').addEventListener('drop', async (e) => {
+    e.preventDefault();
+    if (e.dataTransfer.files.length) await addFiles([...e.dataTransfer.files]);
+  });
+
+  $('#thinkToggle').onclick = async () => {
+    state.settings.enable_thinking = !state.settings.enable_thinking;
+    await api('/api/settings', { method: 'POST', body: { enable_thinking: state.settings.enable_thinking } });
+    refreshState();
+  };
+  $('#toolsToggle').onclick = async () => {
+    state.settings.tools_enabled = !state.settings.tools_enabled;
+    await api('/api/settings', { method: 'POST', body: { tools_enabled: state.settings.tools_enabled } });
+    refreshState();
+  };
+  $('#themeBtn').onclick = toggleTheme;
+  $('#exportBtn').onclick = exportChat;
+  $('#statsBtn').onclick = showStats;
+  $('#logsBtn').onclick = showLogs;
+  $('#forkBtn').onclick = async () => {
+    if (!state.chatId) return;
+    const last = [...state.messages].reverse().find((m) => !String(m.id).startsWith('tmp-'));
+    const r = await api(`/api/chats/${state.chatId}/fork`, { method: 'POST', body: { message_id: last?.id } });
+    await loadChats();
+    await openChat(r.id);
+    toast('Chat forked');
+  };
+  $('#closeLogs').onclick = () => $('#logsModal').classList.remove('open');
+  $('#refreshLogs').onclick = showLogs;
+  $('#closeStats').onclick = () => $('#statsModal').classList.remove('open');
+  $('#openPanel').onclick = () => openPanel('model');
+  $('#paletteBtn').onclick = openPalette;
+  $('#closePanel').onclick = () => $('#panel').classList.remove('open');
+  $('#toggleSidebar').onclick = () => $('#sidebar').classList.toggle('open');
+  $$('#panelTabs button').forEach((b) => (b.onclick = () => openPanel(b.dataset.tab)));
+
+  // model tab
+  $('#modelSearch').onclick = loadModels;
+  $('#modelSource').onchange = loadModels;
+  $('#modelTask').onchange = loadModels;
+  $('#modelQuery').onkeydown = (e) => { if (e.key === 'Enter') loadModels(); };
+  $('#ctxInput').oninput = updateCtxWarn;
+  $('#stopServer').onclick = async () => {
+    await api('/api/server/stop', { method: 'POST', body: {} });
+    toast('Server stopped');
+    refreshState();
+  };
+  $('#cancelLoad').onclick = async () => {
+    await api('/api/server/cancel', { method: 'POST', body: {} });
+    toast('Cancelling…');
+  };
+
+  // settings tab
+  const bindRange = (id, valId, key) => {
+    $('#' + id).oninput = (e) => {
+      $('#' + valId).textContent = e.target.value;
+      state.settings[key] = +e.target.value;
+    };
+  };
+  bindRange('tempRange', 'tempVal', 'temperature');
+  bindRange('toppRange', 'toppVal', 'top_p');
+  bindRange('topkRange', 'topkVal', 'top_k');
+  bindRange('maxtokRange', 'maxtokVal', 'max_tokens');
+  bindRange('repRange', 'repVal', 'repeat_penalty');
+  bindRange('roundsRange', 'roundsVal', 'max_tool_rounds');
+
+  $('#saveParams').onclick = async () => {
+    const body = {
+      system_prompt: $('#sysPrompt').value,
+      memory_enabled: $('#memEnabled').checked,
+      tools_enabled: $('#toolsEnabled').checked,
+      enable_thinking: $('#thinkEnabled').checked,
+      json_mode: $('#jsonEnabled').checked,
+      stream: $('#streamEnabled').checked,
+      auto_title: $('#autoTitleEnabled').checked,
+      temperature: +$('#tempRange').value,
+      top_p: +$('#toppRange').value,
+      top_k: +$('#topkRange').value,
+      max_tokens: +$('#maxtokRange').value,
+      repeat_penalty: +$('#repRange').value,
+      max_tool_rounds: +$('#roundsRange').value,
+      seed: $('#seedInput').value === '' ? null : +$('#seedInput').value,
+      stop: $('#stopInput').value.split(',').map((s) => s.trim()).filter(Boolean),
+      persona: $('#personaSelect').value || null,
+    };
+    await api('/api/settings', { method: 'POST', body });
+    toast('Settings saved');
+    refreshState();
+  };
+
+  $('#personaSelect').onchange = async (e) => {
+    const p = state.personas.find((x) => x.id === e.target.value);
+    if (!p) return;
+    $('#sysPrompt').value = p.system_prompt;
+    let params = {};
+    try { params = JSON.parse(p.params || '{}'); } catch (err) { params = {}; }
+    for (const k of ['temperature', 'top_p', 'top_k', 'max_tokens', 'repeat_penalty']) {
+      if (params[k] != null) {
+        const map = { temperature: ['tempRange', 'tempVal'], top_p: ['toppRange', 'toppVal'],
+                      top_k: ['topkRange', 'topkVal'], max_tokens: ['maxtokRange', 'maxtokVal'],
+                      repeat_penalty: ['repRange', 'repVal'] };
+        const [rid, vid] = map[k];
+        $('#' + rid).value = params[k];
+        $('#' + vid).textContent = params[k];
+      }
+    }
+    $('#saveParams').click();
+  };
+
+  $('#personaSave').onclick = async () => {
+    const name = prompt('Persona name');
+    if (!name) return;
+    await api('/api/personas', {
+      method: 'POST',
+      body: {
+        name,
+        system_prompt: $('#sysPrompt').value,
+        params: {
+          temperature: +$('#tempRange').value, top_p: +$('#toppRange').value,
+          top_k: +$('#topkRange').value, max_tokens: +$('#maxtokRange').value,
+          repeat_penalty: +$('#repRange').value,
+        },
+      },
+    });
+    await loadPersonas();
+    toast(`Persona "${name}" saved`);
+  };
+
+  // memory tab
+  $('#memAdd').onclick = async () => {
+    const text = $('#memInputText').value.trim();
+    if (!text) return;
+    await api('/api/memory', { method: 'POST', body: { text } });
+    $('#memInputText').value = '';
+    loadMemory(); toast('Memory saved');
+  };
+  $('#memInputText').onkeydown = (e) => { if (e.key === 'Enter') $('#memAdd').click(); };
+
+  // prompts tab
+  $('#promptAdd').onclick = async () => {
+    const title = $('#promptTitle').value.trim();
+    const body = $('#promptBody').value.trim();
+    if (!title || !body) return toast('title and body required', 'err');
+    await api('/api/prompts', { method: 'POST', body: { title, body } });
+    $('#promptTitle').value = $('#promptBody').value = '';
+    loadPrompts(); toast('Prompt saved');
+  };
+
+  // harness tab
+  $('#harnessSelect').onchange = fillHarnessForm;
+  $('#hSave').onclick = saveHarness;
+  $('#hPreview').onclick = () => previewHarness().catch((e) => toast(e.message, 'err'));
+  $('#hProbe').onclick = probeHarness;
+  $('#hBind').onclick = bindHarness;
+  $('#harnessNew').onclick = async () => {
+    const name = prompt('Harness name');
+    if (!name) return;
+    const r = await api('/api/harnesses', { method: 'POST', body: { name } });
+    await loadHarnesses();
+    $('#harnessSelect').value = r.id;
+    fillHarnessForm();
+  };
+  $('#harnessDup').onclick = async () => {
+    const h = currentHarness();
+    if (!h.id) return;
+    const r = await api(`/api/harnesses/${h.id}/duplicate`, { method: 'POST', body: {} });
+    await loadHarnesses();
+    $('#harnessSelect').value = r.id;
+    fillHarnessForm();
+  };
+  $('#harnessDel').onclick = async () => {
+    const h = currentHarness();
+    if (!h.id || !confirm(`Delete harness "${h.name}"?`)) return;
+    try {
+      await api(`/api/harnesses/${h.id}`, { method: 'DELETE' });
+      await loadHarnesses();
+      toast('Harness deleted');
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  $('#lessonAdd').onclick = async () => {
+    const lesson = $('#lessonText').value.trim();
+    if (!lesson) return;
+    await api('/api/lessons', { method: 'POST', body: { lesson, domain: 'general' } });
+    $('#lessonText').value = '';
+    loadLessons();
+  };
+  $('#lessonReflect').onclick = async () => {
+    if (!state.chatId) return toast('Open a chat first', 'err');
+    $('#lessonReflect').disabled = true;
+    try {
+      const r = await api('/api/lessons/reflect', { method: 'POST', body: { chat_id: state.chatId } });
+      toast(`Lesson: ${(r.lesson || '').slice(0, 60)}…`);
+      loadLessons();
+    } catch (e) { toast(e.message, 'err'); }
+    $('#lessonReflect').disabled = false;
+  };
+
+  // mcp tab
+  $('#mcpAdd').onclick = async () => {
+    const name = $('#mcpName').value.trim();
+    const command = $('#mcpCmd').value.trim();
+    const args = $('#mcpArgs').value.trim().split(/\s+/).filter(Boolean);
+    if (!name || !command) return toast('name and command required', 'err');
+    await api('/api/mcp/servers', { method: 'POST', body: { name, command, args } });
+    $('#mcpName').value = $('#mcpCmd').value = $('#mcpArgs').value = '';
+    loadMcp(); toast('Server added — press connect');
+  };
+
+  // palette
+  $('#paletteInput').oninput = () => { state.paletteIndex = 0; renderPalette(); };
+  $('#paletteInput').onkeydown = (e) => {
+    if (e.key === 'Escape') return closePalette();
+    const items = paletteItems();
+    if (e.key === 'ArrowDown') { e.preventDefault(); state.paletteIndex = Math.min(items.length - 1, state.paletteIndex + 1); renderPalette(); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); state.paletteIndex = Math.max(0, state.paletteIndex - 1); renderPalette(); }
+    if (e.key === 'Enter') {
+      const it = items[state.paletteIndex];
+      if (it) { closePalette(); it.run(); }
+    }
+  };
+  $('#palette').onclick = (e) => { if (e.target.id === 'palette') closePalette(); };
+
+  document.addEventListener('keydown', (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); }
+    if (mod && e.key.toLowerCase() === 'j') { e.preventDefault(); openPanel('params'); }
+    if (e.key === 'Escape') {
+      closePalette();
+      $('#panel').classList.remove('open');
+      $('#logsModal').classList.remove('open');
+      $('#statsModal').classList.remove('open');
+    }
+  });
+}
+
+async function boot() {
+  bind();
+  const st = await api('/api/settings').catch(() => null);
+  document.documentElement.dataset.theme = st?.theme || 'dark';
+  await refreshState();
+  await loadChats();
+  const recent = state.chats[0];
+  if (recent) await openChat(recent.id); else await newChat();
+  setInterval(refreshState, 8000);
+
+  const ask = new URLSearchParams(location.search).get('ask');
+  if (ask) { await newChat(); sendMessage(ask); }
+  const panel = new URLSearchParams(location.search).get('panel');
+  if (panel) openPanel(panel);
+}
+
+boot();
