@@ -204,7 +204,7 @@ def worker(payload: dict[str, Any]) -> None:
              "--chunked-prefill-size", str(cfg["chunked_prefill_size"])],
             stdout=log, stderr=log, cwd=str(ROOT), env=env,
         )
-        deadline = time.time() + 240
+        deadline = time.time() + 600   # cold weights + Metal warmup can be slow
         while time.time() < deadline:
             if JOB.cancel.is_set():
                 _run(["pkill", "-9", "-f", "sglang.launch_server --model-path"])
@@ -284,6 +284,13 @@ def supervisor(interval: float = 15.0) -> None:
             payload = JOB.last_payload
             if not payload or JOB.get()["state"] in ACTIVE:
                 continue
+            # something may still be warming (job already timed out on /health but the
+            # process is alive): do not kill and restart it — that thrash never converges
+            if _run(["pgrep", "-f", "sglang.launch_server --model-path"]) is not None:
+                running = subprocess.run(["pgrep", "-f", "sglang.launch_server --model-path"],
+                                         capture_output=True, text=True).stdout.strip()
+                if running:
+                    continue
             if not up():
                 print(f"[supervisor] {payload['model']} down — restarting", flush=True)
                 JOB.cancel.clear()

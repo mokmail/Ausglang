@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import os
 import re
@@ -39,7 +40,7 @@ from typing import Any
 
 import httpx
 import harness2_lite as h2
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,6 +64,8 @@ PORT = int(os.environ.get("WORKBENCH_PORT", "8090"))
 # stack lives on the host) and the API returns a clear error instead of dying.
 PY = os.environ.get("SGLANG_PYTHON") or str(ROOT / ".venv/bin/python")
 HF_CACHE_DIR = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache/huggingface")))
+# Per-chat sandbox where the model and the UI may write files.
+ARTIFACTS_DIR = Path(os.environ.get("WORKBENCH_ARTIFACTS", str(DATA / "artifacts")))
 # Optional host-side loader (loader_agent.py). Set when this app runs in a
 # container: Metal cannot be driven from Linux, so start/stop/job are forwarded.
 LOADER_URL = os.environ.get("WORKBENCH_LOADER_URL", "").rstrip("/")
@@ -162,6 +165,10 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS harnesses (
                 id TEXT PRIMARY KEY, name TEXT, components TEXT,
                 created REAL, updated REAL
+            );
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY, chat_id TEXT, name TEXT, path TEXT,
+                size INTEGER, mime TEXT, created REAL
             );
             CREATE TABLE IF NOT EXISTS lessons (
                 id TEXT PRIMARY KEY, domain TEXT, cue TEXT, lesson TEXT,
@@ -629,7 +636,7 @@ def load_worker(payload: dict[str, Any]) -> None:
 
         JOB._set(state="starting", message="starting sglang", progress=100.0)
         _spawn(model, cfg)
-        deadline = time.time() + 240
+        deadline = time.time() + 600
         while time.time() < deadline:
             if JOB.cancel.is_set():
                 subprocess.run(["pkill", "-9", "-f", "sglang.launch_server --model-path"],
@@ -912,6 +919,7 @@ TAGS = [
     {"name": "personas", "description": "Saved system-prompt + sampling profiles."},
     {"name": "harness", "description": "Eight-component harness (c1..c8): system prompt, guardrails, memory, tool guidance, subagents, skills, scripts, plugins — plus probes and the lesson library."},
     {"name": "mcp", "description": "stdio MCP servers, tool discovery, manual invocation."},
+    {"name": "artifacts", "description": "Files the model or user writes into a chat workspace."},
     {"name": "stats", "description": "Token and message accounting."},
 ]
 
@@ -973,6 +981,133 @@ def sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def chat_artifact_dir(chat_id: str) -> Path:
+    d = ARTIFACTS_DIR / re.sub(r"[^A-Za-z0-9_.-]", "_", chat_id or "scratch")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def safe_artifact_name(name: str) -> str:
+    """No traversal, no absolute paths, no separators — a plain file name."""
+    base = Path(str(name or "file.txt").replace("\\", "/")).name
+    base = re.sub(r"[^\w.\-]+", "_", base).strip("._") or "file.txt"
+    return base[:120]
+
+
+def save_artifact(chat_id: str, name: str, content: str | bytes, mime: str = "text/plain") -> dict[str, Any]:
+    d = chat_artifact_dir(chat_id)
+    fname = safe_artifact_name(name)
+    path = d / fname
+    data = content.encode() if isinstance(content, str) else content
+    path.write_bytes(data)
+    aid = h2.new_id()
+    guess = "text/plain"
+    low = fname.lower()
+    for ext, m in ((".pdf", "application/pdf"), (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+                   (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+                   (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                   (".py", "text/x-python"), (".js", "text/javascript"), (".json", "application/json"),
+                   (".md", "text/markdown"), (".html", "text/html"), (".css", "text/css"),
+                   (".csv", "text/csv"), (".sh", "text/x-shellscript"), (".txt", "text/plain")):
+        if low.endswith(ext):
+            guess = m
+            break
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO artifacts (id,chat_id,name,path,size,mime,created) VALUES (?,?,?,?,?,?,?)",
+            (aid, chat_id, fname, str(path), len(data), mime or guess, h2.now()),
+        )
+    return {"id": aid, "name": fname, "size": len(data), "mime": mime or guess,
+            "chat_id": chat_id, "path": str(path)}
+
+
+TEXTISH = (".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml", ".toml",
+           ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".sh", ".sql", ".rs", ".go",
+           ".java", ".c", ".cpp", ".h", ".log", ".xml", ".ini", ".conf", ".env")
+
+
+def _xml_text(xml: bytes) -> str:
+    """Strip tags from OOXML parts, keeping paragraph/row boundaries as newlines."""
+    raw = xml.decode("utf-8", errors="replace")
+    raw = raw.replace("</w:p>", "\n").replace("</a:p>", "\n").replace("</w:tr>", "\n")
+    raw = raw.replace("</si>", "\n").replace("</c>", "\t")
+    raw = re.sub(r"<[^>]+>", "", raw)
+    raw = (raw.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+              .replace("&quot;", '"').replace("&apos;", "'"))
+    return re.sub(r"\n{3,}", "\n\n", raw).strip()
+
+
+def extract_document(name: str, data: bytes) -> tuple[str, dict[str, Any]]:
+    """Return (text, meta) for PDF / DOCX / PPTX / XLSX / plain text. No network, no OCR."""
+    low = (name or "").lower()
+    meta: dict[str, Any] = {"kind": "text"}
+    if low.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise HTTPException(500, "PDF support missing: pypdf is not installed in this deployment")
+        reader = PdfReader(io.BytesIO(data))
+        pages = [(pg.extract_text() or "") for pg in reader.pages]
+        text = "\n\n".join(pages).strip()
+        meta = {"kind": "pdf", "pages": len(pages)}
+        if not text:
+            raise HTTPException(422, "this PDF has no text layer (scanned image?) — no OCR here")
+        return text, meta
+    if low.endswith((".docx", ".pptx", ".xlsx")):
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = z.namelist()
+            if low.endswith(".docx"):
+                text = _xml_text(z.read("word/document.xml"))
+                meta = {"kind": "docx", "parts": 1}
+            elif low.endswith(".pptx"):
+                slides = sorted(n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n))
+                text = "\n\n".join(_xml_text(z.read(n)) for n in slides)
+                meta = {"kind": "pptx", "slides": len(slides)}
+            else:
+                text = _xml_text(z.read("xl/sharedStrings.xml")) if "xl/sharedStrings.xml" in names else ""
+                meta = {"kind": "xlsx", "sheets": len([n for n in names if n.startswith("xl/worksheets/")])}
+        return text.strip(), meta
+    if low.endswith(TEXTISH) or not low.count("."):
+        return data.decode("utf-8", errors="replace"), {"kind": "text"}
+    raise HTTPException(
+        415,
+        f"unsupported file type: {name}. Send PDF, DOCX, PPTX, XLSX or plain text "
+        "(scanned PDFs need OCR, which this box does not run).",
+    )
+
+
+def artifact_rows(chat_id: str | None = None) -> list[dict[str, Any]]:
+    with db() as conn:
+        if chat_id:
+            rows = conn.execute("SELECT * FROM artifacts WHERE chat_id=? ORDER BY created DESC", (chat_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM artifacts ORDER BY created DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def run_artifact_tool(chat_id: str, tool: str, args: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """Native tools: write_file / read_file / list_files inside the chat sandbox."""
+    if tool == "write_file":
+        name = args.get("name") or "file.txt"
+        content = args.get("content")
+        if content is None:
+            return "error: write_file needs `content`", None
+        art = save_artifact(chat_id, name, str(content))
+        return f"wrote {art['name']} ({art['size']} bytes) in this chat's workspace", art
+    if tool == "read_file":
+        name = safe_artifact_name(args.get("name") or "")
+        path = chat_artifact_dir(chat_id) / name
+        if not path.exists():
+            return f"error: no file named {name}", None
+        return path.read_text(errors="replace")[:20000], None
+    if tool == "list_files":
+        files = [{"name": a["name"], "size": a["size"]} for a in artifact_rows(chat_id)]
+        return json.dumps(files), None
+    return f"error: unknown artifact tool {tool}", None
+
+
 def list_harnesses() -> list[dict[str, Any]]:
     with db() as conn:
         rows = conn.execute("SELECT * FROM harnesses ORDER BY created").fetchall()
@@ -1021,6 +1156,35 @@ def effective_tools(harness: dict[str, Any], params: dict[str, Any]) -> list[dic
         return []
     tools = h2.filter_tools(tool_schemas(), harness["rules"].get("tool_allowlist") or [])
     tools = h2.apply_tool_guidance(tools, harness.get("tool_guidance") or {})
+    # native file tools, always available (they are what makes artifacts possible)
+    tools.extend([
+        {
+            "name": "write_file",
+            "server": "artifacts",
+            "description": "Create or overwrite a file in this chat's workspace. Use for code, notes, data, any deliverable.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "file name, e.g. solution.py"},
+                    "content": {"type": "string", "description": "full file contents"},
+                },
+                "required": ["name", "content"],
+            },
+        },
+        {
+            "name": "read_file",
+            "server": "artifacts",
+            "description": "Read back a file from this chat's workspace.",
+            "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+        },
+        {
+            "name": "list_files",
+            "server": "artifacts",
+            "description": "List the files already written in this chat.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+    ])
+
     # c5: every subagent is callable by its own name (models naturally emit that),
     # plus a generic "delegate" escape hatch.
     subs = [x for x in (harness.get("subagents") or []) if x.get("name")]
@@ -1112,6 +1276,7 @@ def api_state() -> dict[str, Any]:
             "memory": conn.execute("SELECT COUNT(*) c FROM memory").fetchone()["c"],
             "prompts": conn.execute("SELECT COUNT(*) c FROM prompts").fetchone()["c"],
             "personas": conn.execute("SELECT COUNT(*) c FROM personas").fetchone()["c"],
+            "artifacts": conn.execute("SELECT COUNT(*) c FROM artifacts").fetchone()["c"],
         }
     return {
         "server": server_info(),
@@ -1673,6 +1838,94 @@ async def api_lessons_reflect(payload: dict = Body(...)) -> dict[str, Any]:
     return {"id": lid, **parsed}
 
 
+
+# ---- artifacts (files the model or the user creates) ----------------------- #
+
+
+@app.get("/api/chats/{chat_id}/artifacts", tags=["artifacts"], summary="Files written in this chat")
+def api_chat_artifacts(chat_id: str) -> list[dict[str, Any]]:
+    return artifact_rows(chat_id)
+
+
+@app.post("/api/chats/{chat_id}/artifacts", tags=["artifacts"], summary="Write a file into the chat workspace")
+def api_artifact_create(chat_id: str, payload: dict = Body(...)) -> dict[str, Any]:
+    name = payload.get("name") or "file.txt"
+    content = payload.get("content")
+    if content is None:
+        raise HTTPException(400, "content required")
+    return save_artifact(chat_id, name, str(content), payload.get("mime") or "text/plain")
+
+
+
+@app.post("/api/extract", tags=["artifacts"], summary="Extract text from an uploaded document")
+async def api_extract(file: UploadFile = File(...)) -> dict[str, Any]:
+    data = await file.read()
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(413, "file larger than 25 MB")
+    text, meta = extract_document(file.filename or "upload", data)
+    return {"name": file.filename, "size": len(data), "chars": len(text), **meta, "text": text}
+
+
+@app.post("/api/chats/{chat_id}/uploads", tags=["artifacts"],
+          summary="Upload a document into the chat: stores the original and returns extracted text")
+async def api_upload(chat_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    data = await file.read()
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(413, "file larger than 25 MB")
+    name = file.filename or "upload"
+    text, meta = extract_document(name, data)
+    art = save_artifact(chat_id, name, data, mime=(file.content_type or "application/octet-stream"))
+    return {"artifact": art, "name": name, "size": len(data), "chars": len(text), **meta, "text": text}
+
+
+@app.get("/api/artifacts", tags=["artifacts"], summary="Recent artifacts across chats")
+def api_artifacts(limit: int = 50) -> list[dict[str, Any]]:
+    return artifact_rows()[:limit]
+
+
+@app.get("/api/artifacts/{aid}", tags=["artifacts"], summary="Download an artifact")
+def api_artifact_download(aid: str) -> Any:
+    row = next((a for a in artifact_rows() if a["id"] == aid), None)
+    if not row:
+        raise HTTPException(404, "no such artifact")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(410, "artifact file is gone")
+    return FileResponse(path, media_type=row["mime"] or "application/octet-stream", filename=row["name"])
+
+
+@app.get("/api/artifacts/{aid}/preview", tags=["artifacts"], summary="Text preview of an artifact")
+def api_artifact_preview(aid: str, max_bytes: int = 65536) -> dict[str, Any]:
+    row = next((a for a in artifact_rows() if a["id"] == aid), None)
+    if not row:
+        raise HTTPException(404, "no such artifact")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(410, "artifact file is gone")
+    raw = path.read_bytes()[:max_bytes]
+    try:
+        text = raw.decode()
+        binary = False
+    except UnicodeDecodeError:
+        text = raw.decode(errors="replace")
+        binary = True
+    return {"id": aid, "name": row["name"], "mime": row["mime"], "size": row["size"],
+            "text": text, "truncated": row["size"] > max_bytes, "binary": binary}
+
+
+@app.delete("/api/artifacts/{aid}", tags=["artifacts"], summary="Delete an artifact")
+def api_artifact_delete(aid: str) -> dict[str, Any]:
+    row = next((a for a in artifact_rows() if a["id"] == aid), None)
+    if row:
+        try:
+            Path(row["path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+        with db() as conn:
+            conn.execute("DELETE FROM artifacts WHERE id=?", (aid,))
+    return {"deleted": aid}
+
+
 # ---- stats ----------------------------------------------------------------- #
 
 
@@ -1832,6 +2085,7 @@ async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
 
     async def gen():
         collected: list[str] = []
+        tool_events: list[dict[str, Any]] = []
         reasoning: list[str] = []
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0}
         rounds = 0
@@ -1901,13 +2155,19 @@ async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
             rounds += 1
             tool_name, args = call["tool"], call["arguments"]
             server = next((t["server"] for t in tools if t["name"] == tool_name), "harness")
-            yield sse("tool", {"tool": tool_name, "server": server, "arguments": args, "state": "running"})
+            ev_running = {"tool": tool_name, "server": server, "arguments": args, "state": "running"}
+            yield sse("tool", ev_running)
             subagent_names = {x.get("name") for x in (harness.get("subagents") or [])}
-            if tool_name == "delegate" or tool_name in subagent_names:
+            if server == "artifacts":
+                result, art = run_artifact_tool(chat_id, tool_name, args)
+                if art:
+                    yield sse("artifact", art)
+            elif tool_name == "delegate" or tool_name in subagent_names:
                 payload = {"name": args.get("name") or tool_name, "task": args.get("task") or args.get("input") or ""}
                 result = await run_delegate(harness, payload, params)
             else:
                 result = await run_tool(server, tool_name, args)
+            tool_events.append({**ev_running, "result": result[:4000], "state": "done"})
             yield sse("tool", {"tool": tool_name, "server": server, "result": result[:4000], "state": "done"})
             messages.append({"role": "assistant", "content": out})
             messages.append({
@@ -1924,7 +2184,7 @@ async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (uuid.uuid4().hex[:12], chat_id, "assistant", final,
                  "".join(reasoning) or None,
-                 json.dumps({"rounds": rounds}) if rounds else None,
+                 json.dumps({"rounds": rounds, "events": tool_events}) if rounds else None,
                  json.dumps({"usage": usage_total, "elapsed_s": elapsed, "model": params.get("model"),
                              "guardrails": h2.check_output(harness, final), "prompt": prompt_report}),
                  time.time()),

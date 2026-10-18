@@ -79,6 +79,26 @@ function md(src) {
   text = text.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
   text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
 
+  // pipe tables
+  const lines = text.split('\n');
+  const tbl = [];
+  for (let i = 0; i < lines.length; i++) {
+    const head = lines[i];
+    const sep = lines[i + 1] || '';
+    if (head.includes('|') && /^\s*\|?[\s:-]*-[\s|:-]*$/.test(sep)) {
+      const parse = (row) => row.replace(/^\s*\||\|\s*$/g, '').split('|').map((c) => c.trim());
+      let html = '<table><thead><tr>' + parse(head).map((h) => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
+      i += 2;
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+        html += '<tr>' + parse(lines[i]).map((c) => `<td>${c}</td>`).join('') + '</tr>';
+        i++;
+      }
+      tbl.push(html + '</tbody></table>');
+      lines[i - 1] = `\u0000TBL${tbl.length - 1}\u0000`;
+    }
+  }
+  text = lines.join('\n');
+
   const out = [];
   let list = null;
   for (const line of text.split('\n')) {
@@ -101,10 +121,16 @@ function md(src) {
   let html = out.join('\n').split(/\u0000P\u0000+/)
     .map((chunk) => (chunk.trim() ? `<p>${chunk.replace(/\n/g, '<br>')}</p>` : '')).join('');
 
+  html = html.replace(/\u0000TBL(\d+)\u0000/g, (_, i) => tbl[+i]);
   html = html.replace(/\u0000BLOCK(\d+)\u0000/g, (_, i) => {
     const b = blocks[+i];
     const lang = (b.lang || '').toLowerCase();
-    return `<pre><code data-lang="${esc(lang)}">${highlight(b.code.replace(/\n$/, ''), lang)}</code></pre>`;
+    const code = b.code.replace(/\n$/, '');
+    if (lang === 'mermaid') {
+      return `<div class="mermaid-wrap" data-mermaid="${esc(code)}"><pre class="mermaid-src" hidden>${esc(code)}</pre></div>`;
+    }
+    const wrapped = `<pre data-code="${esc(code)}"><code data-lang="${esc(lang)}">${highlight(code, lang)}</code></pre>`;
+    return wrapped;
   });
   return html;
 }
@@ -247,6 +273,14 @@ function msgEl(m, idx) {
     const tl = document.createElement('div');
     tl.className = 'tool-log';
     tl.innerHTML = `<div class="th"><span class="tico"></span><b>${m.tools.rounds} tool round(s)</b></div>`;
+    const events = m.tools.events || [];
+    if (events.length) {
+      const pre = document.createElement('pre');
+      pre.textContent = events.map((e) =>
+        `${e.tool} (${e.server})\n  args: ${JSON.stringify(e.arguments)}\n  → ${(e.result || '').slice(0, 600)}`
+      ).join('\n\n');
+      tl.appendChild(pre);
+    }
     bubble.appendChild(tl);
   }
   const body = document.createElement('div');
@@ -294,6 +328,9 @@ function msgEl(m, idx) {
     s.textContent = `${m.meta.usage.prompt_tokens}→${m.meta.usage.completion_tokens} tok · ${m.meta.elapsed_s}s`;
     actions.appendChild(s);
   }
+  if (m.artifacts && m.artifacts.length) {
+    for (const a of m.artifacts) bubble.appendChild(artCard(a, { inline: true }));
+  }
   if (m.edited) {
     const e = document.createElement('span');
     e.className = 'edited';
@@ -302,6 +339,7 @@ function msgEl(m, idx) {
   }
   bubble.appendChild(actions);
   wrap.append(avatar, bubble);
+  if (m.role === 'assistant') { attachCodeSave(bubble); enrich(bubble); }
   return wrap;
 }
 
@@ -504,6 +542,11 @@ async function sendMessage(textOverride) {
             }
           }
           $('#messages').scrollTop = $('#messages').scrollHeight;
+        } else if (ev === 'artifact') {
+          assistant.artifacts = assistant.artifacts || [];
+          assistant.artifacts.push(data);
+          aEl.querySelector('.bubble').appendChild(artCard(data, { inline: true }));
+          toast(`File written: ${data.name}`);
         } else if (ev === 'error') {
           toast(data.message, 'err');
           assistant.content += `\n\n**Error:** ${data.message}`;
@@ -578,7 +621,11 @@ function renderAttachments() {
     const chip = document.createElement('span');
     chip.className = 'file-chip';
     chip.innerHTML = `<span></span><button title="Remove">×</button>`;
-    chip.querySelector('span').textContent = `${f.name} (${Math.round(f.text.length / 1024)} KB)`;
+    const kind = f.kind && f.kind !== 'text'
+      ? `${f.kind.toUpperCase()}${f.pages ? ` · ${f.pages}p` : f.slides ? ` · ${f.slides} slides` : ''}`
+      : `${Math.round(f.text.length / 1024)} KB`;
+    chip.querySelector('span').textContent = `${f.name} — ${kind}${f.truncated ? ' · trimmed' : ''}`;
+    chip.title = `${f.chars || f.text.length} chars extracted`;
     chip.querySelector('button').onclick = () => {
       state.attachments.splice(i, 1);
       renderAttachments();
@@ -588,15 +635,134 @@ function renderAttachments() {
   updateCtxMeter();
 }
 
+const TEXT_EXT = /\.(txt|md|markdown|csv|tsv|json|ya?ml|toml|py|js|ts|tsx|jsx|html|css|sh|sql|rs|go|java|c|cpp|h|log|xml|ini|conf)$/i;
+const MAX_UPLOAD = 25 * 1024 * 1024;
+
+function contextCharBudget() {
+  const ctx = Number(state.settings.context_length) || 12288;
+  return Math.max(4000, Math.floor((ctx - 2500) * 3.4));
+}
+
+async function uploadDocument(file) {
+  if (!state.chatId) await newChat();
+  const fd = new FormData();
+  fd.append('file', file);
+  const res = await fetch(`/api/chats/${state.chatId}/uploads`, { method: 'POST', body: fd });
+  if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+  return res.json();
+}
+
 async function addFiles(files) {
+  const budget = contextCharBudget();
   for (const file of files) {
-    if (file.size > 400 * 1024) { toast(`${file.name} is too large (400 KB max)`, 'err'); continue; }
-    const text = await file.text();
-    state.attachments.push({ name: file.name, text });
+    if (file.size > MAX_UPLOAD) { toast(`${file.name} is too large (25 MB max)`, 'err'); continue; }
+    try {
+      if (TEXT_EXT.test(file.name) || !file.name.includes('.')) {
+        const text = await file.text();
+        state.attachments.push({ name: file.name, text, kind: 'text', chars: text.length });
+      } else {
+        toast(`Extracting ${file.name}…`);
+        const r = await uploadDocument(file);
+        let text = r.text;
+        let truncated = false;
+        if (text.length > budget) { text = text.slice(0, budget); truncated = true; }
+        state.attachments.push({
+          name: r.name, text, kind: r.kind, pages: r.pages, slides: r.slides,
+          chars: r.chars, truncated,
+        });
+        toast(`${r.name}: ${r.chars.toLocaleString()} chars${r.pages ? ` from ${r.pages} pages` : ''}${truncated ? ' (trimmed to context)' : ''}`);
+        loadFiles();
+      }
+    } catch (e) {
+      toast(e.message, 'err');
+    }
   }
   renderAttachments();
 }
 
+
+/* ---------- rich post-processing: mermaid, html preview, code bar ---------- */
+let mermaidSeq = 0;
+
+function initMermaid() {
+  if (!window.mermaid || window.mermaid.__ready) return;
+  window.mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: 'strict',
+    theme: document.documentElement.dataset.theme === 'light' ? 'default' : 'dark',
+    themeVariables: { fontFamily: 'ui-sans-serif, system-ui' },
+  });
+  window.mermaid.__ready = true;
+}
+
+async function renderMermaid(scope) {
+  initMermaid();
+  if (!window.mermaid) return;
+  const nodes = [...scope.querySelectorAll('.mermaid-wrap')].filter((n) => !n.dataset.done);
+  if (!nodes.length) return;
+  for (const node of nodes) {
+    const srcEl = node.querySelector('.mermaid-src');
+    const src = srcEl ? srcEl.textContent : node.dataset.mermaid;
+    if (!src || !src.trim()) continue;
+    const id = `mmd-${++mermaidSeq}`;
+    try {
+      const { svg } = await window.mermaid.render(id, src.trim());
+      node.innerHTML = svg;
+      node.dataset.done = '1';
+    } catch (e) {
+      node.dataset.done = '1';
+      node.innerHTML = `<div class="mermaid-err">mermaid error: ${esc(String(e.message || e)).slice(0, 300)}</div>`;
+    }
+  }
+}
+
+function attachCodeBars(scope) {
+  scope.querySelectorAll('pre[data-code]').forEach((pre) => {
+    if (pre.querySelector('.code-bar')) return;
+    const code = pre.dataset.code;
+    const bar = document.createElement('div');
+    bar.className = 'code-bar';
+    const copy = document.createElement('button');
+    copy.textContent = 'copy';
+    copy.onclick = async (e) => { e.stopPropagation(); await navigator.clipboard.writeText(code); toast('Copied'); };
+    const save = document.createElement('button');
+    save.textContent = 'save file';
+    save.onclick = (e) => {
+      e.stopPropagation();
+      const lang = (pre.querySelector('code')?.dataset.lang || '').toLowerCase();
+      const ext = { python: 'py', py: 'py', js: 'js', javascript: 'js', ts: 'ts', json: 'json',
+                    bash: 'sh', sh: 'sh', html: 'html', css: 'css', md: 'md', sql: 'sql',
+                    yaml: 'yml', yml: 'yml', csv: 'csv', mermaid: 'mmd' }[lang] || 'txt';
+      const name = prompt('File name', `snippet.${ext}`);
+      if (name) saveTextAsFile(name, code);
+    };
+    bar.append(copy, save);
+    pre.appendChild(bar);
+  });
+}
+
+function attachHtmlPreviews(scope) {
+  scope.querySelectorAll('pre[data-code]').forEach((pre) => {
+    const lang = (pre.querySelector('code')?.dataset.lang || '').toLowerCase();
+    if (!['html', 'svg'].includes(lang)) return;
+    if (pre.nextElementSibling?.classList.contains('html-preview')) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'html-preview';
+    wrap.innerHTML = `<div class="hp-head"><span>sandboxed preview</span><span class="grow"></span>
+      <button class="mini">toggle</button></div><iframe sandbox="allow-scripts" loading="lazy"></iframe>`;
+    const frame = wrap.querySelector('iframe');
+    frame.srcdoc = pre.dataset.code;
+    frame.hidden = true;
+    wrap.querySelector('button').onclick = () => { frame.hidden = !frame.hidden; };
+    pre.after(wrap);
+  });
+}
+
+function enrich(scope) {
+  attachCodeBars(scope);
+  attachHtmlPreviews(scope);
+  renderMermaid(scope);
+}
 
 /* --------------------------- model switcher --------------------------- */
 async function openModelMenu() {
@@ -1121,6 +1287,76 @@ async function loadLessons() {
   }
 }
 
+
+/* --------------------------- artifacts / files --------------------------- */
+function artCard(a, { inline = false } = {}) {
+  const el = document.createElement('div');
+  el.className = 'art-card';
+  const size = a.size > 1024 ? (a.size / 1024).toFixed(1) + ' KB' : (a.size || 0) + ' B';
+  el.innerHTML = `<div class="art-head">
+      <b></b><span class="sz"></span><span class="grow"></span>
+      <button class="mini p">preview</button>
+      <a class="mini d" href="/api/artifacts/${encodeURIComponent(a.id)}" download>download</a>
+      <button class="mini x" title="delete">×</button>
+    </div><pre hidden></pre>`;
+  el.querySelector('b').textContent = a.name;
+  el.querySelector('.sz').textContent = size;
+  el.querySelector('.p').onclick = async () => {
+    const pre = el.querySelector('pre');
+    if (!pre.hidden) { pre.hidden = true; return; }
+    const r = await api(`/api/artifacts/${a.id}/preview`);
+    pre.textContent = r.text + (r.truncated ? '\n… (truncated)' : '');
+    pre.hidden = false;
+  };
+  el.querySelector('.x').onclick = async () => {
+    await api(`/api/artifacts/${a.id}`, { method: 'DELETE' });
+    el.remove();
+    if (!inline) loadFiles();
+    toast('File deleted');
+  };
+  return el;
+}
+
+async function loadFiles() {
+  const list = $('#fileList');
+  if (!list) return;
+  if (!state.chatId) { list.innerHTML = '<div class="muted" style="padding:8px">Open a chat first</div>'; return; }
+  const rows = await api(`/api/chats/${state.chatId}/artifacts`);
+  state.artifacts = rows;
+  list.innerHTML = '';
+  if (!rows.length) { list.innerHTML = '<div class="muted" style="padding:8px">No files in this chat yet</div>'; return; }
+  rows.forEach((a) => list.appendChild(artCard(a)));
+}
+
+async function saveTextAsFile(name, text) {
+  if (!state.chatId) await newChat();
+  const r = await api(`/api/chats/${state.chatId}/artifacts`, { method: 'POST', body: { name, content: text } });
+  toast(`Saved ${r.name}`);
+  loadFiles();
+  return r;
+}
+
+// every fenced code block in a reply gets a save button
+function attachCodeSave(scope) {
+  scope.querySelectorAll('pre > code').forEach((code) => {
+    const pre = code.parentElement;
+    if (pre.querySelector('.code-save')) return;
+    const btn = document.createElement('button');
+    btn.className = 'code-save';
+    btn.textContent = 'save file';
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const lang = (code.dataset.lang || '').toLowerCase();
+      const ext = { python: 'py', py: 'py', js: 'js', javascript: 'js', ts: 'ts', json: 'json',
+                    bash: 'sh', sh: 'sh', html: 'html', css: 'css', md: 'md', sql: 'sql',
+                    yaml: 'yml', yml: 'yml', csv: 'csv' }[lang] || 'txt';
+      const name = prompt('File name', `snippet.${ext}`);
+      if (name) saveTextAsFile(name, code.textContent);
+    };
+    pre.appendChild(btn);
+  });
+}
+
 /* ----------------------------- modals ----------------------------- */
 async function showLogs() {
   const lines = await api('/api/server/logs?tail=400');
@@ -1157,6 +1393,7 @@ function paletteItems() {
     { label: 'Open prompts', kind: 'action', run: () => openPanel('prompts') },
     { label: 'Open MCP servers', kind: 'action', run: () => openPanel('mcp') },
     { label: 'Open harness editor', kind: 'action', run: () => openPanel('harness') },
+    { label: 'Open files', kind: 'action', run: () => openPanel('files') },
     { label: 'Usage stats', kind: 'action', run: showStats },
     { label: 'Server logs', kind: 'action', run: showLogs },
     { label: 'Export chat', kind: 'action', run: exportChat },
@@ -1206,6 +1443,7 @@ function openPanel(tab = 'model') {
   if (tab === 'mcp') loadMcp();
   if (tab === 'params') loadPersonas();
   if (tab === 'harness') { loadHarnesses(); loadLessons(); }
+  if (tab === 'files') loadFiles();
 }
 
 function exportChat() {
@@ -1216,6 +1454,12 @@ function exportChat() {
 async function toggleTheme() {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = next;
+  if (window.mermaid) window.mermaid.__ready = false;   // re-init for the new palette
+  document.querySelectorAll('.mermaid-wrap[data-done]').forEach((n) => {
+    const src = n.dataset.mermaid;
+    if (src) { n.dataset.done = ''; n.innerHTML = `<pre class="mermaid-src" hidden>${esc(src)}</pre>`; }
+  });
+  renderMermaid(document.body);
   await api('/api/settings', { method: 'POST', body: { theme: next } });
 }
 
@@ -1439,6 +1683,15 @@ function bind() {
       loadLessons();
     } catch (e) { toast(e.message, 'err'); }
     $('#lessonReflect').disabled = false;
+  };
+
+  // files tab
+  $('#fileCreate').onclick = async () => {
+    const name = $('#fileName').value.trim() || 'note.txt';
+    const body = $('#fileBody').value;
+    if (!body) return toast('nothing to save', 'err');
+    await saveTextAsFile(name, body);
+    $('#fileBody').value = '';
   };
 
   // mcp tab

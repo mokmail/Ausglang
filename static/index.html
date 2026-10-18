@@ -106,10 +106,10 @@
           <div id="attachRow" class="attach-row" hidden></div>
           <textarea id="input" rows="1" placeholder="Message the model…  (⏎ send · ⇧⏎ newline · ⌘K palette)"></textarea>
           <div class="input-tools">
-            <button class="mini icon" id="attachBtn" title="Attach a text file">
+            <button class="mini icon" id="attachBtn" title="Attach a document (PDF, DOCX, PPTX, XLSX, text)">
               <svg viewBox="0 0 24 24"><path d="M21 12.5l-8.5 8.5a5 5 0 0 1-7-7l8.5-8.5a3.5 3.5 0 0 1 5 5L10 19"/></svg>
             </button>
-            <input type="file" id="fileInput" multiple hidden accept=".txt,.md,.json,.py,.js,.ts,.csv,.log,.yaml,.yml,.toml,.sh,.html,.css,.sql,.rs,.go,.java,.c,.cpp,.h">
+            <input type="file" id="fileInput" multiple hidden accept=".pdf,.docx,.pptx,.xlsx,.txt,.md,.json,.py,.js,.ts,.csv,.log,.yaml,.yml,.toml,.sh,.html,.css,.sql,.rs,.go,.java,.c,.cpp,.h">
             <button class="mini" id="thinkToggle" title="Show the reasoning pass (Qwen3-style models)">thinking</button>
             <button class="mini" id="toolsToggle" title="Allow MCP tool calls">tools <span id="toolCount">0</span></button>
             <span class="grow"></span>
@@ -133,6 +133,7 @@
         <button data-tab="memory">Memory</button>
         <button data-tab="prompts">Prompts</button>
         <button data-tab="harness">Harness</button>
+        <button data-tab="files">Files</button>
         <button data-tab="mcp">MCP</button>
       </div>
       <button class="icon-btn" id="closePanel" title="Close">
@@ -285,6 +286,18 @@
         <div class="list" id="lessonList"></div>
       </div>
 
+      <div class="tab-pane" data-pane="files">
+        <p class="muted">Files written in this chat. The model can create them with the <code>write_file</code> tool; you can save any code block from a reply.</p>
+        <div class="list" id="fileList"></div>
+        <div class="divider"></div>
+        <div class="row">
+          <input id="fileName" placeholder="name.py">
+          <button class="btn primary" id="fileCreate">Save text as file</button>
+        </div>
+        <label class="field"><span>Content</span><textarea id="fileBody" rows="5" placeholder="…"></textarea></label>
+        <pre class="log" id="filePreview" hidden></pre>
+      </div>
+
       <div class="tab-pane" data-pane="mcp">
         <p class="muted">MCP servers are launched over stdio. Tools appear in the composer and in the model's prompt.</p>
         <div class="grid2">
@@ -327,6 +340,7 @@
 
   <div id="toasts"></div>
 </div>
+<script src="/static/vendor/mermaid.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

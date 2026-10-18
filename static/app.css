@@ -289,3 +289,38 @@ input[type=range]{width:100%;accent-color:var(--accent);margin:2px 0}
 
 .chip-btn.switching{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%, var(--line))}
 #input:disabled{opacity:.55}
+
+/* artifacts */
+.art-card{border:1px solid var(--line2);border-radius:var(--radius-sm);margin:10px 0;overflow:hidden;
+  background:var(--bg2)}
+.art-head{display:flex;align-items:center;gap:9px;padding:8px 11px;font-size:12.6px;color:var(--fg-dim)}
+.art-head b{color:var(--accent3);font-weight:600}
+.art-head .sz{color:var(--fg-mute);font-size:11.4px;font-variant-numeric:tabular-nums}
+.art-head .grow{flex:1}
+.art-card pre{margin:0;border:0;border-radius:0;max-height:260px;overflow:auto;border-top:1px solid var(--line)}
+.body pre{position:relative}
+.code-save{position:absolute;top:7px;right:8px;opacity:0;transition:.15s;background:var(--panel);
+  border:1px solid var(--line2);border-radius:7px;padding:2px 8px;font-size:11px;color:var(--fg-dim);cursor:pointer}
+.body pre:hover .code-save{opacity:1}
+.code-save:hover{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%, var(--line))}
+
+/* rich rendering: code headers, mermaid, html preview */
+.body pre code[data-lang]:not([data-lang=""])::before{
+  content:attr(data-lang);position:absolute;top:7px;left:12px;font-size:10.5px;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--fg-mute);pointer-events:none}
+.body pre{padding-top:26px}
+.code-bar{position:absolute;top:6px;right:8px;display:flex;gap:5px;opacity:0;transition:.15s}
+.body pre:hover .code-bar{opacity:1}
+.code-bar button{background:var(--panel);border:1px solid var(--line2);border-radius:7px;padding:2px 8px;
+  font-size:11px;color:var(--fg-dim);cursor:pointer}
+.code-bar button:hover{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%, var(--line))}
+.mermaid-wrap{border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--bg2);
+  padding:12px;margin:10px 0;overflow:auto;text-align:center}
+.mermaid-wrap svg{max-width:100%;height:auto}
+.mermaid-err{color:var(--warn);font-size:12px;text-align:left;white-space:pre-wrap}
+.html-preview{border:1px solid var(--line);border-radius:var(--radius-sm);margin:10px 0;overflow:hidden}
+.html-preview .hp-head{display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg2);
+  font-size:11.6px;color:var(--fg-dim)}
+.html-preview iframe{width:100%;height:340px;border:0;background:#fff;display:block}
+.body table{border-collapse:collapse;margin:10px 0;font-size:13px}
+.body table th{background:var(--bg2)}

@@ -15,6 +15,14 @@ jget() { curl -s -m 15 "$WB$1"; }
 
 echo "workbench = $WB   sglang = $UP"
 
+# preflight: a cold model can take minutes to warm; do not report 20 false failures
+if [ "${SKIP_PREFLIGHT:-0}" != "1" ]; then
+  for _ in $(seq 1 24); do
+    [ "$(curl -s -m 4 -o /dev/null -w '%{http_code}' $UP/health)" = "200" ] && break
+    sleep 5
+  done
+fi
+
 # ---- backend + config ------------------------------------------------------
 check "workbench /healthz"        "[ \$(curl -s -m 5 -o /dev/null -w '%{http_code}' $WB/healthz) = '200' ]"
 check "sglang upstream healthy"   "[ \$(curl -s -m 5 -o /dev/null -w '%{http_code}' $UP/health) = '200' ]"
@@ -129,10 +137,30 @@ check "reflect honours the response shape" "grep -q 'lesson' /tmp/wb_reflect.out
 check "lesson delete"                     "curl -s -X DELETE -m 10 $WB/api/lessons/$LID | grep -q deleted"
 check "harness delete"                    "curl -s -X DELETE -m 10 $WB/api/harnesses/$HID | grep -q deleted"
 
+
+# ---- artifacts (model + user created files) --------------------------------
+AC=$(curl -s -X POST -m 10 $WB/api/chats -H 'Content-Type: application/json' -d '{}' | $PY -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+printf '%s' '{"name":"verify.txt","content":"written by the verify suite"}' > /tmp/wb_art.json
+ART=$(curl -s -m 10 -X POST $WB/api/chats/$AC/artifacts -H 'Content-Type: application/json' -d @/tmp/wb_art.json)
+AID=$(echo "$ART" | $PY -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
+check "artifact written"            "[ -n '$AID' ]"
+check "artifact listed"             "curl -s -m 8 $WB/api/chats/$AC/artifacts | grep -q verify.txt"
+check "artifact preview"            "curl -s -m 8 $WB/api/artifacts/$AID/preview | grep -q 'written by the verify suite'"
+check "artifact download"           "[ \$(curl -s -m 8 -o /dev/null -w '%{http_code}' $WB/api/artifacts/$AID) = '200' ]"
+check "artifact path traversal blocked" "curl -s -m 8 -X POST $WB/api/chats/$AC/artifacts -H 'Content-Type: application/json' -d '{\"name\":\"../../evil.sh\",\"content\":\"x\"}' | grep -q '\"name\":\"evil.sh\"'"
+
+printf '%s' "{\"chat_id\":\"$AC\",\"message\":\"Use the write_file tool to create model.txt containing exactly: hello artifacts\"}" > /tmp/wb_wf.json
+curl -s -N -m 240 $WB/api/chat -H 'Content-Type: application/json' -d @/tmp/wb_wf.json > /tmp/wb_wf.out
+check "model can call write_file"   "grep -q 'write_file' /tmp/wb_wf.out"
+check "artifact event streamed"     "grep -q 'event: artifact' /tmp/wb_wf.out"
+check "file exists after chat"      "curl -s -m 8 $WB/api/chats/$AC/artifacts | grep -q model.txt"
+check "artifact delete"             "curl -s -X DELETE -m 8 $WB/api/artifacts/$AID | grep -q deleted"
+
 # ---- cleanup ---------------------------------------------------------------
 curl -s -X DELETE -m 10 $WB/api/chats/$CID >/dev/null
 curl -s -X DELETE -m 10 $WB/api/chats/$TCID >/dev/null
 curl -s -X DELETE -m 10 $WB/api/chats/$HC >/dev/null
+curl -s -X DELETE -m 10 $WB/api/chats/$AC >/dev/null
 
 echo "---"; [ $fail -eq 0 ] && echo "RESULT: ad-hoc checks all passed" || echo "RESULT: FAILURES PRESENT"
 exit $fail
