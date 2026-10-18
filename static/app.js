@@ -50,6 +50,7 @@ async function api(path, opts = {}) {
 const LANG_ALIASES = { js: 'javascript', ts: 'typescript', py: 'python', sh: 'bash', yml: 'yaml', md: 'markdown' };
 
 function codeBlock(code, infostring = '') {
+  if (!code || !code.trim()) return '';   // a model that emits empty fences should not draw empty boxes
   const rawLang = (infostring || '').trim().split(/\s+/)[0].toLowerCase();
   const lang = LANG_ALIASES[rawLang] || rawLang;
   if (rawLang === 'mermaid') {
