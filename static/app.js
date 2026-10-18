@@ -13,6 +13,7 @@ const state = {
   server: {},
   job: {},
   attachments: [],
+  optimistic: null,
   personas: [],
   stats: null,
   harnesses: [],
@@ -423,6 +424,9 @@ function updateCtxMeter() {
 
 async function sendMessage(textOverride) {
   if (state.streaming) return;
+  if (JOB_ACTIVE.includes(state.job.state) && !(state.server && state.server.up)) {
+    return toast(`model is ${state.job.state} — wait for ready`, 'err');
+  }
   const text = (textOverride ?? $('#input').value).trim();
   if (!text) return;
   if (!state.chatId) await newChat();
@@ -609,12 +613,13 @@ async function openModelMenu() {
     return;
   }
   const loadable = state.canLoadModels !== false;
+  const busy = JOB_ACTIVE.includes((state.job || {}).state);
   const rows = models
     .filter((m) => !/gguf|onnx|embed|rerank|whisper|clip|docling/i.test(m.id))
     .slice(0, 12)
     .map((m) => {
       const cur = m.id === serving;
-      return `<button class="m-item" data-model="${esc(m.id)}" ${cur || !loadable ? 'disabled' : ''}>
+      return `<button class="m-item" data-model="${esc(m.id)}" ${cur || !loadable || busy ? 'disabled' : ''}>
         ${cur ? '<span class="cur"></span>' : '<span style="width:7px"></span>'}
         <span class="nm">${esc(m.id)}</span>
         <span class="sz">${m.size_gb ? m.size_gb + ' GB' : ''}${cur ? ' · serving' : ''}</span>
@@ -622,7 +627,7 @@ async function openModelMenu() {
     }).join('');
 
   menu.innerHTML = `
-    <div class="m-head">Switch model — one click restarts the server</div>
+    <div class="m-head">${busy ? `busy: ${esc(state.job.state)} ${esc((state.job.model || '').split('/').pop())}` : 'Switch model — one click restarts the server'}</div>
     ${rows || '<div class="m-hint">No downloaded models found</div>'}
     ${loadable ? '' : `<div class="m-hint">⚠ model loading is disabled in this deployment (run the host loader)</div>`}
     <div class="m-sep"></div>
@@ -642,8 +647,38 @@ async function openModelMenu() {
   };
 }
 
+// One place decides what the header/composer look like while a model changes.
+// Sources: the click that started the switch (optimistic) or an in-flight job
+// observed after a reload — both must show the same thing.
+function applySwitchingUI() {
+  const chip = $('#modelChip');
+  const target = state.optimistic
+    || (JOB_ACTIVE.includes((state.job || {}).state) ? state.job.model : null);
+  const name = (target || '').split('/').pop();
+  if (target) {
+    chip.classList.add('switching');
+    chip.firstChild.textContent = `→ ${name}`;
+    $('#input').disabled = true;
+    $('#input').placeholder = `switching to ${name}…`;
+    $('#sendBtn').disabled = true;
+  } else {
+    chip.classList.remove('switching');
+    $('#input').disabled = false;
+    $('#input').placeholder = 'Message the model…  (⏎ send · ⇧⏎ newline · ⌘K palette)';
+    $('#sendBtn').disabled = false;
+  }
+}
+
+function setSwitching(on, model) {
+  state.optimistic = on ? model : null;
+  applySwitchingUI();
+}
+
 async function switchModel(model) {
   $('#modelMenu').hidden = true;
+  if (JOB_ACTIVE.includes(state.job.state)) {
+    return toast(`already ${state.job.state} ${state.job.model || ''}`.trim(), 'err');
+  }
   const payload = {
     model,
     context_length: +($('#ctxInput')?.value || state.settings.context_length),
@@ -652,11 +687,15 @@ async function switchModel(model) {
     mlx_cache_gb: +($('#cacheInput')?.value || state.settings.mlx_cache_gb),
   };
   try {
+    setSwitching(true, model);
     await api('/api/server/start', { method: 'POST', body: payload });
     toast(`Switching to ${model.split('/').pop()}…`);
     $('#jobBanner').hidden = false;
-    pollJob();
+    await pollJob();
+    setSwitching(false);
+    refreshState();
   } catch (e) {
+    setSwitching(false);
     toast(e.message, 'err');
   }
 }
@@ -678,7 +717,7 @@ async function refreshState() {
     $('#statusDot').className = 'dot ' + (jobActive ? 'busy' : up ? 'on' : 'off');
     $('#statusText').textContent = jobActive
       ? `${state.job.state} ${state.job.progress ? Math.round(state.job.progress) + '%' : ''}`.trim()
-      : up ? `${(state.settings.model || '').split('/').pop()} · up` : 'server down';
+      : up ? `${((s.server && s.server.model) || state.settings.model || '').split('/').pop()} · up` : 'server down';
     $('#brandSub').textContent = up
       ? `local · Metal · ${(s.server?.context_length || state.settings.context_length).toLocaleString()} ctx`
       : 'local · Metal · offline';
@@ -693,13 +732,15 @@ async function refreshState() {
     $('#thinkToggle').classList.toggle('on', !!s.settings.enable_thinking);
     $('#jobChip').hidden = !jobActive;
     if (jobActive) {
+      const pct = state.job.state === 'downloading' ? ` ${Math.round(state.job.progress || 0)}%` : '';
       $('#jobChip').className = 'chip busy';
-      $('#jobChip').textContent = `${state.job.state} ${Math.round(state.job.progress || 0)}%`;
+      $('#jobChip').textContent = `${state.job.state}${pct}`;
     }
     if (state.job.state === 'ready' && !jobDoneUntil) jobDoneUntil = Date.now() + 4000;
     if (JOB_ACTIVE.includes(state.job.state)) jobErrDismissed = false;
     renderServerCard();
     renderJobBanner();
+    applySwitchingUI();
     applySettingsToForm();
   } catch (e) {
     $('#statusDot').className = 'dot off';
@@ -1456,13 +1497,19 @@ async function boot() {
       if (changed) {
         renderJobBanner();
         renderServerCard();
+        applySwitchingUI();
         const activeJob = JOB_ACTIVE.includes(j.state);
         $('#statusDot').className = 'dot ' + (activeJob ? 'busy' : (state.server && state.server.up ? 'on' : 'off'));
+        const pctTxt = j.state === 'downloading' && j.progress ? ` ${Math.round(j.progress)}%` : '';
         $('#statusText').textContent = activeJob
-          ? `${j.state} ${j.progress ? Math.round(j.progress) + '%' : ''}`.trim()
-          : (state.server && state.server.up ? `${(state.settings.model || '').split('/').pop()} · up` : 'server down');
+          ? `${j.state}${pctTxt}`
+          : (state.server && state.server.up ? `${(state.server.model || state.settings.model || '').split('/').pop()} · up` : 'server down');
         $('#jobChip').hidden = !activeJob;
-        if (activeJob) { $('#jobChip').className = 'chip busy'; $('#jobChip').textContent = `${j.state} ${Math.round(j.progress || 0)}%`; }
+        if (activeJob) {
+          const pct = j.state === 'downloading' ? ` ${Math.round(j.progress || 0)}%` : '';
+          $('#jobChip').className = 'chip busy';
+          $('#jobChip').textContent = `${j.state}${pct}`;
+        }
       }
     } catch (e) { /* workbench offline */ }
   }, 1000);

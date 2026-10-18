@@ -158,6 +158,13 @@ def worker(payload: dict[str, Any]) -> None:
     JOB.set(state="preparing", model=model, progress=0.0, message="checking model",
             error=None, started=time.time(), finished=None)
     try:
+        # Download BEFORE touching the running server: switching to an uncached
+        # model must not take the old one offline for the whole download.
+        if cached_size(model) == 0:
+            download(model)
+        else:
+            JOB.set(progress=100.0, message="already in HF cache")
+
         if up():
             JOB.set(state="stopping", message="stopping the running server")
             _run(["pkill", "-f", "sglang.launch_server --model-path"])
@@ -167,10 +174,6 @@ def worker(payload: dict[str, Any]) -> None:
                 time.sleep(1)
             _run(["pkill", "-9", "-f", "sglang.launch_server --model-path"])
             time.sleep(2)
-        if cached_size(model) == 0:
-            download(model)
-        else:
-            JOB.set(progress=100.0, message="already in HF cache")
 
         cfg = {
             "context_length": int(payload.get("context_length") or CTX_CEILING),

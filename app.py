@@ -610,6 +610,12 @@ def load_worker(payload: dict[str, Any]) -> None:
     JOB._set(state="preparing", model=model, progress=0.0, message="checking model",
              error=None, started=time.time(), finished=None)
     try:
+        detail = model_detail(model)
+        if not detail["downloaded"]:
+            _download(model)          # the old server keeps answering meanwhile
+        else:
+            JOB._set(progress=100.0, message="already in HF cache")
+
         if server_up():
             JOB._set(state="stopping", message="stopping the running server")
             subprocess.run(["pkill", "-f", "sglang.launch_server --model-path"], capture_output=True)
@@ -620,12 +626,6 @@ def load_worker(payload: dict[str, Any]) -> None:
             subprocess.run(["pkill", "-9", "-f", "sglang.launch_server --model-path"],
                            capture_output=True)
             time.sleep(2)
-
-        detail = model_detail(model)
-        if not detail["downloaded"]:
-            _download(model)
-        else:
-            JOB._set(progress=100.0, message="already in HF cache")
 
         JOB._set(state="starting", message="starting sglang", progress=100.0)
         _spawn(model, cfg)
@@ -1784,6 +1784,12 @@ async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
     attachments = payload.get("attachments") or []
     if not chat_id or (not text and not regenerate):
         raise HTTPException(400, "chat_id and message required (or regenerate=true)")
+
+    if not server_up():
+        state_now = JOB.snapshot()["state"]
+        if state_now in ("preparing", "downloading", "starting", "stopping"):
+            raise HTTPException(409, f"model is {state_now} — try again when it reports ready")
+        raise HTTPException(503, "the model server is down — start one from the model switcher")
 
     settings = load_settings()
     params = {**settings, **(payload.get("params") or {})}
