@@ -997,8 +997,11 @@ async function refreshState() {
       try { fn(); } catch (e) { console.warn('[ui]', fn.name, e && e.message); }
     }
   } catch (e) {
+    const why = (e && e.message) || String(e);
     $('#statusDot').className = 'dot off';
     $('#statusText').textContent = 'workbench offline';
+    $('#statusText').title = why;
+    $('#serverPill').dataset.err = why;
   }
 }
 
