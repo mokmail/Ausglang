@@ -503,7 +503,6 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
 .msg.user{flex-direction:row-reverse}
 .msg.user .bubble{flex:0 1 auto;max-width:78%;background:var(--user);border:1px solid var(--line2);
   border-radius:14px 14px 4px 14px;padding:11px 14px}
-.msg.user .body{white-space:pre-wrap}
 .msg.assistant .bubble{flex:1 1 auto;max-width:100%}
 .msg .body{padding-top:2px}
 
