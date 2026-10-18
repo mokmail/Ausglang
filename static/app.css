@@ -522,3 +522,8 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
 .composer-tools{display:flex;align-items:center;gap:8px;margin-top:6px}
 .composer-tools .grow{flex:1}
 .stats{margin:6px auto 0;max-width:var(--measure)}
+
+/* send button sits inside the composer toolbar */
+.composer-tools .send{width:34px;height:34px;padding:0;display:grid;place-items:center;border-radius:10px}
+.composer-tools .send svg{width:17px;height:17px}
+#input{display:block;width:100%}

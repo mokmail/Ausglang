@@ -106,10 +106,10 @@
 
     <footer id="composer">
       <div class="composer-inner">
-        <div class="input-wrap">
+        <div class="composer-box">
           <div id="attachRow" class="attach-row" hidden></div>
           <textarea id="input" rows="1" placeholder="Message the model…  (⏎ send · ⇧⏎ newline · ⌘K palette)"></textarea>
-          <div class="input-tools">
+          <div class="composer-tools">
             <button class="mini icon" id="attachBtn" title="Attach a document (PDF, DOCX, PPTX, XLSX, text)">
               <svg viewBox="0 0 24 24"><path d="M21 12.5l-8.5 8.5a5 5 0 0 1-7-7l8.5-8.5a3.5 3.5 0 0 1 5 5L10 19"/></svg>
             </button>
@@ -119,11 +119,11 @@
             <span class="grow"></span>
             <span class="hint" id="ctxMeter" title="Approximate prompt size vs the context window">ctx 0%</span>
             <span class="hint" id="streamHint"></span>
+            <button class="btn send" id="sendBtn" title="Send (⏎)">
+              <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-6-7-2z"/></svg>
+            </button>
           </div>
         </div>
-        <button class="btn send" id="sendBtn" title="Send (⏎)">
-          <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-6-7-2z"/></svg>
-        </button>
       </div>
       <div class="stats" id="statsBar"></div>
     </footer>
