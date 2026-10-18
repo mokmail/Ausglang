@@ -87,14 +87,18 @@ function md(src) {
     const sep = lines[i + 1] || '';
     if (head.includes('|') && /^\s*\|?[\s:-]*-[\s|:-]*$/.test(sep)) {
       const parse = (row) => row.replace(/^\s*\||\|\s*$/g, '').split('|').map((c) => c.trim());
+      const start = i;
       let html = '<table><thead><tr>' + parse(head).map((h) => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
       i += 2;
       while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
         html += '<tr>' + parse(lines[i]).map((c) => `<td>${c}</td>`).join('') + '</tr>';
         i++;
       }
+      const end = Math.min(i - 1, lines.length - 1);
       tbl.push(html + '</tbody></table>');
-      lines[i - 1] = `\u0000TBL${tbl.length - 1}\u0000`;
+      lines[start] = `\u0000TBL${tbl.length - 1}\u0000`;
+      for (let k = start + 1; k <= end; k++) lines[k] = '';
+      i = end;
     }
   }
   text = lines.join('\n');
@@ -708,6 +712,16 @@ async function renderMermaid(scope) {
     try {
       const { svg } = await window.mermaid.render(id, src.trim());
       node.innerHTML = svg;
+      const svgEl = node.querySelector('svg');
+      if (svgEl) {
+        const vb = (svgEl.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
+        if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) {
+          svgEl.setAttribute('width', Math.round(vb[2]));
+          svgEl.setAttribute('height', Math.round(vb[3]));
+          svgEl.style.maxWidth = '100%';
+          svgEl.style.height = 'auto';
+        }
+      }
       node.dataset.done = '1';
     } catch (e) {
       node.dataset.done = '1';
