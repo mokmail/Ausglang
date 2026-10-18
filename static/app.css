@@ -22,7 +22,38 @@ button,input,select,textarea{font:inherit;color:inherit}
 button svg,.icon-btn svg,.search svg,.mini svg,.brand svg,.chip-btn svg{
   width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;
   stroke-linecap:round;stroke-linejoin:round}
-#app{display:grid;grid-template-columns:288px 1fr;height:100%;position:relative}
+/* layout variables are written by the UI-state module (persisted) */
+:root{--side-w:288px;--panel-w:410px;--measure:830px;--msg-gap:20px;--chat-pad:26px}
+#app{display:grid;grid-template-columns:var(--side-w) 1fr;height:100%;position:relative}
+#app.with-panel{grid-template-columns:var(--side-w) 1fr var(--panel-w)}
+#app.no-side{grid-template-columns:0 1fr}
+#app.no-side.with-panel{grid-template-columns:0 1fr var(--panel-w)}
+
+/* drag handles */
+.resizer{position:relative;width:0;cursor:col-resize;z-index:30}
+.resizer::after{content:"";position:absolute;inset:0 -3px;background:transparent;transition:.15s}
+.resizer:hover::after,.resizer.dragging::after{background:color-mix(in srgb,var(--accent) 55%, transparent)}
+.resizer.side{grid-column:1;justify-self:end}
+
+@media(min-width:1360px){
+  /* the panel stops being an overlay: it becomes the third column */
+  #panel{position:relative;transform:none;width:auto;height:100%;min-width:0;
+    border-left:1px solid var(--line);background:var(--panel);display:none;
+    grid-column:3;flex-direction:column;overflow:hidden}
+  #panel.open{display:flex;transform:none;box-shadow:none}
+  #panelResize{display:block}
+  .thread,.composer-inner{max-width:var(--measure)}
+}
+
+/* density */
+#app[data-density="compact"]{--msg-gap:12px;--chat-pad:16px}
+#app[data-density="compact"] .body{font-size:14px;line-height:1.55}
+#app[data-density="compact"] .msg .bubble{padding:9px 12px}
+#app[data-density="compact"] #topbar{padding:9px 16px}
+#app[data-density="compact"] .chats .chat{padding:6px 9px}
+
+#messages{padding:var(--chat-pad) 20px 8px}
+.thread{gap:var(--msg-gap)}
 
 /* sidebar */
 #sidebar{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;
@@ -83,8 +114,8 @@ button svg,.icon-btn svg,.search svg,.mini svg,.brand svg,.chip-btn svg{
 .chip.busy{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%, var(--line))}
 .top-actions{display:flex;gap:4px}
 
-#messages{flex:1;overflow-y:auto;padding:26px 20px 8px;scroll-behavior:smooth}
-.thread{max-width:830px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
+#messages{flex:1;overflow-y:auto;scroll-behavior:smooth}
+.thread{max-width:var(--measure);margin:0 auto;display:flex;flex-direction:column;gap:var(--msg-gap)}
 .msg{display:flex;gap:13px;align-items:flex-start}
 .avatar{flex:0 0 30px;width:30px;height:30px;border-radius:9px;display:grid;place-items:center;font-size:12px;
   font-weight:700;background:var(--bg2);border:1px solid var(--line);color:var(--fg-dim)}
@@ -143,7 +174,7 @@ button svg,.icon-btn svg,.search svg,.mini svg,.brand svg,.chip-btn svg{
 
 /* composer */
 #composer{border-top:1px solid var(--line);padding:13px 20px 12px;background:color-mix(in srgb,var(--panel) 55%, transparent)}
-.composer-inner{max-width:830px;margin:0 auto;display:flex;gap:10px;align-items:flex-end}
+.composer-inner{max-width:var(--measure);margin:0 auto;display:flex;gap:10px;align-items:flex-end}
 .input-wrap{flex:1;background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);
   padding:9px 11px 7px;transition:.15s}
 .input-wrap:focus-within{border-color:color-mix(in srgb,var(--accent) 45%, var(--line))}

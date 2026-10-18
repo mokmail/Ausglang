@@ -1315,6 +1315,27 @@ def api_state() -> dict[str, Any]:
     }
 
 
+@app.get("/api/ui-state", tags=["system"], summary="UI state remembered by this workspace")
+def api_ui_state() -> dict[str, Any]:
+    """Layout, filters, drafts and the last opened chat.
+
+    The browser keeps its own copy in localStorage (instant, no round-trip); this
+    is the durable copy that survives a new browser profile, a container rebuild
+    or a different machine on the LAN.
+    """
+    return {"state": load_settings().get("ui_state") or {}}
+
+
+@app.post("/api/ui-state", tags=["system"], summary="Remember UI state")
+def api_ui_state_save(payload: dict = Body(...)) -> dict[str, Any]:
+    s = load_settings()
+    current = dict(s.get("ui_state") or {})
+    current.update({k: v for k, v in payload.items() if v is not None})
+    s["ui_state"] = current
+    save_settings(s)
+    return {"saved": True, "keys": sorted(current)}
+
+
 @app.post("/api/settings", tags=["system"], summary="Patch saved settings")
 def api_save_settings(patch: SettingsPatch = Body(...)) -> dict[str, Any]:
     patch = patch.model_dump(exclude_none=True)

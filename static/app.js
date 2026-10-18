@@ -43,6 +43,152 @@ async function api(path, opts = {}) {
   return ct.includes('json') ? r.json() : r.text();
 }
 
+/* --------------------------- remembered state --------------------------- */
+/* Everything the user changed about the workspace is remembered twice:
+   localStorage for an instant restore, and /api/ui-state so a new browser or
+   another machine on the LAN opens the same layout. */
+
+const UI_KEY = 'wb.ui.v1';
+const UI_DEFAULTS = {
+  chatId: null, tab: 'model', panel: false, sidebar: true, theme: 'dark',
+  density: 'comfortable', sideW: 288, panelW: 410, measure: 830,
+  modelSource: 'cache', modelTask: '', modelQuery: '',
+  harness: null, persona: null, drafts: {}, scroll: {}, filesTab: 'chats',
+};
+
+const UI = {
+  state: { ...UI_DEFAULTS },
+  _saveTimer: null,
+  _remote: null,
+
+  load() {
+    try {
+      const raw = localStorage.getItem(UI_KEY);
+      if (raw) Object.assign(this.state, JSON.parse(raw));
+    } catch (e) { /* private mode */ }
+    return this.state;
+  },
+
+  async hydrate() {
+    // ask the server only when this browser has never seen the workspace
+    if (localStorage.getItem(UI_KEY)) return this.state;
+    try {
+      const r = await api('/api/ui-state');
+      if (r && r.state) Object.assign(this.state, r.state);
+    } catch (e) { /* offline */ }
+    return this.state;
+  },
+
+  set(patch, { save = true } = {}) {
+    Object.assign(this.state, patch);
+    if (save) this.save();
+  },
+
+  save() {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => {
+      try { localStorage.setItem(UI_KEY, JSON.stringify(this.state)); } catch (e) { /* quota */ }
+      this.pushRemote();
+    }, 350);
+  },
+
+  pushRemote() {
+    clearTimeout(this._remote);
+    this._remote = setTimeout(() => {
+      const { drafts, scroll, ...durable } = this.state;   // keep the payload small
+      api('/api/ui-state', { method: 'POST', body: durable }).catch(() => {});
+    }, 2500);
+  },
+
+  draft(chatId, text) {
+    if (!chatId) return;
+    if (text) this.state.drafts[chatId] = text;
+    else delete this.state.drafts[chatId];
+    this.save();
+  },
+
+  rememberScroll(chatId, top) {
+    if (!chatId) return;
+    this.state.scroll[chatId] = Math.round(top);
+    this.save();
+  },
+};
+
+function applyLayout() {
+  const app = $('#app');
+  if (!app) return;
+  const s = UI.state;
+  document.documentElement.dataset.theme = s.theme || 'dark';
+  app.dataset.density = s.density || 'comfortable';
+  app.style.setProperty('--side-w', `${Math.max(220, Math.min(460, s.sideW || 288))}px`);
+  app.style.setProperty('--panel-w', `${Math.max(320, Math.min(760, s.panelW || 410))}px`);
+  app.style.setProperty('--measure', `${Math.max(620, Math.min(1200, s.measure || 830))}px`);
+  app.classList.toggle('no-side', !s.sidebar);
+  app.classList.toggle('with-panel', !!s.panel);
+  $('#panel').classList.toggle('open', !!s.panel);
+  $('#panelResize').hidden = !s.panel;
+  $('#sideResize').hidden = !s.sidebar;
+  const btn = $('#densityBtn');
+  if (btn) btn.classList.toggle('on', s.density === 'compact');
+}
+
+function bindLayout() {
+  // drag a handle, persist the width
+  const drag = (handle, { onMove, onEnd }) => {
+    if (!handle) return;
+    handle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      handle.classList.add('dragging');
+      handle.setPointerCapture(e.pointerId);
+      const move = (ev) => onMove(ev);
+      const up = () => {
+        handle.classList.remove('dragging');
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', up);
+        onEnd && onEnd();
+      };
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', up);
+    });
+  };
+
+  drag($('#panelResize'), {
+    onMove: (ev) => {
+      const w = Math.round(window.innerWidth - ev.clientX);
+      UI.state.panelW = Math.max(320, Math.min(760, w));
+      $('#app').style.setProperty('--panel-w', `${UI.state.panelW}px`);
+    },
+    onEnd: () => UI.save(),
+  });
+
+  drag($('#sideResize'), {
+    onMove: (ev) => {
+      UI.state.sideW = Math.max(220, Math.min(460, Math.round(ev.clientX)));
+      $('#app').style.setProperty('--side-w', `${UI.state.sideW}px`);
+    },
+    onEnd: () => UI.save(),
+  });
+
+  $('#panelResize').addEventListener('dblclick', () => { UI.set({ panelW: 410 }); applyLayout(); });
+  $('#sideResize').addEventListener('dblclick', () => { UI.set({ sideW: 288 }); applyLayout(); });
+
+  $('#densityBtn').onclick = () => {
+    UI.set({ density: UI.state.density === 'compact' ? 'comfortable' : 'compact' });
+    applyLayout();
+  };
+
+  // remember the composer draft of the open chat
+  const input = $('#input');
+  input.addEventListener('input', () => UI.draft(state.chatId, input.value));
+
+  // remember scroll position per chat
+  let scrollTimer = null;
+  $('#messages').addEventListener('scroll', () => {
+    clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(() => UI.rememberScroll(state.chatId, $('#messages').scrollTop), 300);
+  });
+}
+
 /* ----------------------------- markdown ----------------------------- */
 /* Rendered with marked (CommonMark + GFM), sanitised with DOMPurify, code
    highlighted with highlight.js. Everything is vendored: no network. */
@@ -314,12 +460,20 @@ function emptyState() {
 /* --------------------------- chat flow --------------------------- */
 async function openChat(id) {
   state.chatId = id;
+  UI.set({ chatId: id });
   state.messages = await api(`/api/chats/${id}/messages`);
   const chat = state.chats.find((c) => c.id === id);
   $('#chatTitle').textContent = chat?.title || 'Chat';
   renderMessages();
   renderChats();
   $('#sidebar').classList.remove('open');
+  // restore what this chat looked like the last time it was open
+  const input = $('#input');
+  input.value = UI.state.drafts[id] || '';
+  input.style.height = 'auto';
+  const top = UI.state.scroll[id];
+  const scroller = $('#messages');
+  scroller.scrollTop = typeof top === 'number' ? top : scroller.scrollHeight;
 }
 
 async function newChat() {
@@ -1383,6 +1537,9 @@ function closePalette() { $('#palette').classList.remove('open'); }
 
 /* ------------------------------ wiring ------------------------------ */
 function openPanel(tab = 'model') {
+  UI.set({ panel: true, tab });
+  $('#app').classList.add('with-panel');
+  $('#panelResize').hidden = false;
   $('#panel').classList.add('open');
   $$('#panelTabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $$('.tab-pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
@@ -1403,6 +1560,7 @@ function exportChat() {
 async function toggleTheme() {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = next;
+  UI.set({ theme: next });
   if (window.mermaid) window.mermaid.__ready = false;   // re-init for the new palette
   document.querySelectorAll('.mermaid-wrap[data-done]').forEach((n) => {
     const src = n.dataset.mermaid;
@@ -1456,7 +1614,12 @@ function bind() {
   $('#closeStats').onclick = () => $('#statsModal').classList.remove('open');
   $('#openPanel').onclick = () => openPanel('model');
   $('#paletteBtn').onclick = openPalette;
-  $('#closePanel').onclick = () => $('#panel').classList.remove('open');
+  $('#closePanel').onclick = () => {
+    $('#panel').classList.remove('open');
+    $('#app').classList.remove('with-panel');
+    $('#panelResize').hidden = true;
+    UI.set({ panel: false });
+  };
   $('#toggleSidebar').onclick = () => $('#sidebar').classList.toggle('open');
   $$('#panelTabs button').forEach((b) => (b.onclick = () => openPanel(b.dataset.tab)));
 
@@ -1475,6 +1638,16 @@ function bind() {
 
   // model tab
   $('#modelSearch').onclick = loadModels;
+  ['#modelSource', '#modelTask'].forEach((sel) => {
+    const el = $(sel);
+    if (!el) return;
+    el.onchange = () => {
+      UI.set(sel === '#modelSource' ? { modelSource: el.value } : { modelTask: el.value });
+      loadModels();
+    };
+  });
+  const mq = $('#modelQuery');
+  if (mq) mq.oninput = () => UI.set({ modelQuery: mq.value });
   $('#modelSource').onchange = loadModels;
   $('#modelTask').onchange = loadModels;
   $('#modelQuery').onkeydown = (e) => { if (e.key === 'Enter') loadModels(); };
@@ -1683,13 +1856,35 @@ function bind() {
 }
 
 async function boot() {
+  // 1. restore the workspace shape before anything paints
+  UI.load();
+  applyLayout();
   bind();
+  bindLayout();
+
   const st = await api('/api/settings').catch(() => null);
-  document.documentElement.dataset.theme = st?.theme || 'dark';
+  if (!UI.state.theme) UI.state.theme = st?.theme || 'dark';
+  if (!localStorage.getItem(UI_KEY)) await UI.hydrate();
+  applyLayout();
+  document.documentElement.dataset.theme = UI.state.theme || 'dark';
+
   await refreshState();
   await loadChats();
+
+  // 2. reopen the chat that was open, else the most recent one
+  const remembered = UI.state.chatId && state.chats.some((c) => c.id === UI.state.chatId);
   const recent = state.chats[0];
-  if (recent) await openChat(recent.id); else await newChat();
+  if (remembered) await openChat(UI.state.chatId);
+  else if (recent) await openChat(recent.id);
+  else await newChat();
+
+  // filters
+  if ($('#modelSource')) $('#modelSource').value = UI.state.modelSource || 'cache';
+  if ($('#modelTask')) $('#modelTask').value = UI.state.modelTask || '';
+  if ($('#modelQuery')) $('#modelQuery').value = UI.state.modelQuery || '';
+
+  // 3. restore the panel/tab last used
+  if (UI.state.panel) openPanel(UI.state.tab || 'model');
   // model-load progress is polled on its own cheap endpoint, every second
   setInterval(async () => {
     try {

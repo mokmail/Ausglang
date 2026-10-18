@@ -47,6 +47,7 @@
     </div>
   </aside>
 
+  <div id="sideResize" class="resizer side" hidden title="Drag to resize"></div>
   <main id="main">
     <header id="topbar">
       <button class="icon-btn only-mobile" id="toggleSidebar" title="Chats">
@@ -69,6 +70,9 @@
         </button>
         <button class="icon-btn" id="exportBtn" title="Export chat">
           <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+        </button>
+        <button class="icon-btn" id="densityBtn" title="Compact density (⌘⇧D)">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16M4 10h16M4 14h16M4 18h10"/></svg>
         </button>
         <button class="icon-btn" id="themeBtn" title="Toggle theme">
           <svg viewBox="0 0 24 24"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
@@ -125,6 +129,7 @@
     </footer>
   </main>
 
+  <div id="panelResize" class="resizer" hidden title="Drag to resize"></div>
   <aside id="panel">
     <div class="panel-head">
       <div class="tabs" id="panelTabs">
