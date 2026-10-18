@@ -471,9 +471,9 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
   .jb-num{display:none}
 }
 
+#scrim{position:fixed;inset:0;background:rgba(0,0,0,.32);z-index:39;display:none}
 @media(max-width:1359px){
-  #app.with-panel::before{content:"";position:fixed;inset:0;background:rgba(0,0,0,.42);
-    z-index:39;backdrop-filter:blur(1px)}
+  #app.with-panel #scrim{display:block}
   #panel{z-index:40}
 }
 @media(max-width:1200px){
