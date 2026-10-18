@@ -295,6 +295,11 @@ and worth knowing but is not what SGLang competes for. Example on this 24 GB M4 
 pool ≈ 98,304 tokens, ctx 12,288
 ```
 
+The plan is a starting point: the loader checks the real KV pool after the engine answers
+`/health` and refits (mem-fraction, context, concurrency) if the pool is too small to serve a
+conversation. A plan that looks generous against *total* memory is clamped by what is free right
+now — that is how a 3B model at fraction 0.62 used to die with a Metal OOM.
+
 ## Layout and remembered state
 
 The workspace is a real three-column layout, not a chat page with a drawer:

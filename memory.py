@@ -68,11 +68,27 @@ def _proc_rss(pattern: str) -> tuple[float, int]:
     return round(total / GB, 2), count
 
 
+def _engine_rss() -> tuple[float, int]:
+    """RSS of every SGLang process — launcher, scheduler and detokenizer are separate,
+    and the launcher alone is a rounding error against the weights it owns."""
+    total = 0
+    count = 0
+    for p in psutil.process_iter(["cmdline", "memory_info"]):
+        try:
+            cmd = p.info["cmdline"] or []
+            if any(a == "sglang.launch_server" or a.strip().startswith("sglang::") for a in cmd):
+                total += p.info["memory_info"].rss
+                count += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return round(total / GB, 2), count
+
+
 def snapshot() -> dict[str, Any]:
     """Live host memory picture, in GB, plus the processes that compete for it."""
     vm = psutil.virtual_memory()
     sw = psutil.swap_memory()
-    sglang_gb, sglang_procs = _proc_rss("sglang.launch_server")
+    sglang_gb, sglang_procs = _engine_rss()
     docker_gb, docker_procs = _proc_rss("Virtualization.VirtualMachine")
     engine_gb, engine_procs = _proc_rss("workbench/app.py")
     return {
@@ -143,6 +159,19 @@ def kv_bytes_per_token(model: str) -> int:
     return int(2 * layers * kv_heads * head_dim * nbytes)  # K and V
 
 
+def _note(wgb: float, kv_gb: float, alloc_gb: float, frac: float, free: float,
+          pool: int, ctx: int, bpt: int, snap_engine: bool = False) -> str:
+    head = (f"{wgb:.2f} GB weights + {max(0.0, kv_gb):.2f} GB KV of {alloc_gb:.2f} GB "
+            f"(mem-fraction {frac}, {free:.1f} GB free)")
+    if not bpt:
+        return head + " — KV cost unknown, model config not cached yet"
+    if not pool:
+        return head + " — the weights alone do not fit; lower the context, pick a smaller model"
+    if snap_engine:
+        head += " (engine running — RAM returns when it stops)"
+    return f"{head}; pool ≈ {pool:,} tokens, ctx {ctx:,}"
+
+
 def plan(model: str, ctx_ceiling: int = 12288, reserve_gb: float | None = None) -> dict[str, Any]:
     """Pick mem-fraction and context length that fit this machine right now.
 
@@ -164,11 +193,22 @@ def plan(model: str, ctx_ceiling: int = 12288, reserve_gb: float | None = None) 
         m = re.search(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])", model)
         wgb = round(float(m.group(1)) * 0.62, 2) if m else 2.0
 
-    frac = round(min(0.62, max(0.22, budget / total)), 3)
+    # the allocation must also fit what is free *right now* — SGLang cannot use RAM
+    # that the rest of the desktop is holding, which is how a 3B model ends up OOMing
+    # at a fraction that looks fine against total memory.
+    # free RAM is the honest signal: Metal holds weights outside process RSS, so a
+    # running engine looks small while its memory is simply gone. The loader stops the
+    # engine before a load, and that is the moment these numbers describe.
+    free = snap["available_gb"]
+    headroom = max(0.22, (free - 1.5) / total)
+    frac = round(min(0.62, max(0.22, budget / total), headroom), 3)
     alloc_gb = frac * total
     kv_gb = alloc_gb - wgb - 0.6            # 0.6 GB of runtime/activation overhead
     bpt = kv_bytes_per_token(model) or 0
-    pool = int(max(0.0, kv_gb) * GB / bpt) if bpt else 0
+    # Metal's allocator and SGLang's own buffers take roughly half of the theoretical
+    # KV room (calibrated: a 3B at fraction 0.45 yields ~33k tokens, not the ~65k the
+    # naive arithmetic suggests), so the estimate stays conservative.
+    pool = int(max(0.0, kv_gb) * GB / bpt * 0.5) if bpt else 0
 
     ctx = ctx_ceiling
     if pool:
@@ -189,12 +229,8 @@ def plan(model: str, ctx_ceiling: int = 12288, reserve_gb: float | None = None) 
         "pool_tokens": pool,
         "context_length": ctx,
         "feasible": fits,
-        "note": (
-            f"{wgb:.2f} GB weights + {max(0.0, kv_gb):.2f} GB KV of {alloc_gb:.2f} GB allocated "
-            f"(mem-fraction {frac}); pool ≈ {pool:,} tokens, ctx {ctx:,}"
-            if pool else
-            f"{wgb:.2f} GB weights, KV cost unknown (model config not cached yet)"
-        ),
+        "note": _note(wgb, kv_gb, alloc_gb, frac, free, pool, ctx, bpt,
+                      bool(snap["sglang_procs"])),
     }
 
 
