@@ -18,7 +18,10 @@ html[data-theme="light"]{
 html,body{height:100%;margin:0}
 body{background:var(--bg);color:var(--fg);font:14.5px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
 button,input,select,textarea{font:inherit;color:inherit}
-svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+/* icon defaults — scoped so they cannot touch inline SVG content such as mermaid diagrams */
+button svg,.icon-btn svg,.search svg,.mini svg,.brand svg,.chip-btn svg{
+  width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;
+  stroke-linecap:round;stroke-linejoin:round}
 #app{display:grid;grid-template-columns:288px 1fr;height:100%;position:relative}
 
 /* sidebar */
@@ -381,3 +384,7 @@ input[type=range]{width:100%;accent-color:var(--accent);margin:2px 0}
 .hljs-emphasis{font-style:italic}
 .hljs-strong{font-weight:700}
 html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
+
+/* inline SVG content keeps its own geometry */
+.body svg,.mermaid-wrap svg{width:auto;height:auto;max-width:100%;fill:initial;stroke:none}
+.mermaid-wrap svg{display:block;margin:0 auto}
