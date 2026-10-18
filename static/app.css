@@ -475,10 +475,12 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
   .jb-num{display:none}
 }
 
-#scrim{position:fixed;inset:0;background:rgba(0,0,0,.32);z-index:39;display:none}
+/* scrim: only when the panel overlays the chat (narrow screens) */
+#scrim{position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:39;
+  opacity:0;pointer-events:none;transition:opacity .18s}
 @media(max-width:1359px){
-  #app.with-panel #scrim{display:block}
-  #panel{z-index:40}
+  #app.with-panel #scrim{opacity:1;pointer-events:auto}
+  #panel{z-index:40;box-shadow:-24px 0 48px rgba(0,0,0,.45)}
 }
 @media(max-width:1200px){
   #app{grid-template-columns:0 1fr}
