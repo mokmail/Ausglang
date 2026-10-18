@@ -245,3 +245,44 @@ input[type=range]{width:100%;accent-color:var(--accent);margin:2px 0}
   #panel{width:min(410px,100%)}
   .stat-grid{grid-template-columns:repeat(2,1fr)}
 }
+
+/* model-load banner: visible on every tab, mirrors /api/server/job */
+#jobBanner{border-bottom:1px solid var(--line);background:linear-gradient(90deg,
+  color-mix(in srgb,var(--accent) 10%, var(--panel)), var(--panel) 60%);padding:8px 20px 0}
+#jobBanner.err{background:linear-gradient(90deg, rgba(248,113,113,.14), var(--panel) 60%)}
+#jobBanner.done{background:linear-gradient(90deg, rgba(74,222,128,.16), var(--panel) 60%)}
+.jb-row{display:flex;align-items:center;gap:10px;font-size:12.6px;color:var(--fg-dim);
+  max-width:830px;margin:0 auto;padding-bottom:7px}
+.jb-row .grow{flex:1}
+.jb-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 1.1s infinite}
+#jobBanner.err .jb-dot{background:var(--danger);animation:none}
+#jobBanner.done .jb-dot{background:var(--accent);animation:none}
+#jbState{color:var(--fg);text-transform:capitalize}
+.jb-model{color:var(--accent2);font-family:var(--mono);font-size:11.8px}
+.jb-num{font-variant-numeric:tabular-nums;color:var(--fg-mute)}
+.jb-track{height:4px;background:var(--line);border-radius:999px;overflow:hidden;max-width:830px;margin:0 auto 8px}
+.jb-fill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .35s ease}
+.jb-fill.indet{width:32% !important;animation:jbslide 1.1s ease-in-out infinite}
+@keyframes jbslide{0%{margin-left:-32%}100%{margin-left:100%}}
+#jobBanner.err .jb-fill{background:var(--danger)}
+
+/* header model switcher */
+.chip-btn{display:inline-flex;align-items:center;gap:5px;cursor:pointer;background:var(--bg2);
+  color:var(--fg);border:1px solid var(--line);font:inherit;font-size:11.5px;padding:2px 8px}
+.chip-btn:hover{border-color:color-mix(in srgb,var(--accent) 45%, var(--line));color:var(--fg)}
+.chip-btn .chev{width:12px;height:12px;opacity:.6}
+.title-wrap{position:relative}
+.menu{position:absolute;top:calc(100% + 6px);left:0;z-index:50;width:min(430px,86vw);
+  background:var(--panel);border:1px solid var(--line2);border-radius:12px;box-shadow:var(--shadow);
+  padding:6px;display:flex;flex-direction:column;gap:2px}
+.menu .m-head{font-size:10.8px;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-mute);
+  padding:6px 9px 3px}
+.menu .m-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:8px;cursor:pointer;
+  font-size:13px;color:var(--fg-dim);border:0;background:none;text-align:left;width:100%}
+.menu .m-item:hover:not(:disabled){background:var(--bg2);color:var(--fg)}
+.menu .m-item:disabled{opacity:.45;cursor:not-allowed}
+.menu .m-item .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.menu .m-item .sz{font-size:11px;color:var(--fg-mute);font-variant-numeric:tabular-nums}
+.menu .m-item .cur{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:0 0 auto}
+.menu .m-sep{height:1px;background:var(--line);margin:4px 6px}
+.menu .m-hint{padding:6px 10px 8px;font-size:11.4px;color:var(--fg-mute)}

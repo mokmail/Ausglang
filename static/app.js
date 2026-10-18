@@ -108,6 +108,81 @@ function md(src) {
   return html;
 }
 
+
+/* --------------------------- model load banner --------------------------- */
+const jobSample = { t: 0, bytes: 0, rate: 0 };
+let jobDoneUntil = 0;
+let jobErrDismissed = false;
+
+const fmtBytes = (n) => {
+  if (!n) return '';
+  if (n > 1024 ** 3) return (n / 1024 ** 3).toFixed(2) + ' GB';
+  if (n > 1024 ** 2) return (n / 1024 ** 2).toFixed(0) + ' MB';
+  return (n / 1024).toFixed(0) + ' KB';
+};
+const fmtDur = (s) => (s >= 90 ? Math.round(s / 60) + ' min' : Math.round(s) + ' s');
+
+function renderJobBanner() {
+  const j = state.job || {};
+  const el = $('#jobBanner');
+  if (!el) return;
+  const active = JOB_ACTIVE.includes(j.state);
+  const failed = j.state === 'failed';
+  const readyFlash = j.state === 'ready' && Date.now() < jobDoneUntil;
+
+  if (!active && !failed && !readyFlash) { el.hidden = true; return; }
+  if (failed && jobErrDismissed) { el.hidden = true; return; }
+
+  el.hidden = false;
+  el.className = failed ? 'err' : readyFlash ? 'done' : '';
+
+  const now = Date.now();
+  const bytes = j.bytes_done || 0;
+  if (bytes && now - jobSample.t > 600) {
+    if (jobSample.bytes && bytes > jobSample.bytes) {
+      const dt = (now - jobSample.t) / 1000;
+      jobSample.rate = (bytes - jobSample.bytes) / dt;
+    }
+    jobSample.t = now;
+    jobSample.bytes = bytes;
+  }
+  if (!active) { jobSample.t = 0; jobSample.bytes = 0; jobSample.rate = 0; }
+
+  const pct = Math.round(j.progress || 0);
+  const indeterminate = ['starting', 'preparing', 'stopping'].includes(j.state);
+  $('#jbState').textContent = failed ? 'load failed' : readyFlash ? 'ready' : j.state;
+  $('#jbModel').textContent = j.model || '';
+  const fill = $('#jbFill');
+  fill.classList.toggle('indet', indeterminate);
+  fill.style.width = (failed ? 100 : readyFlash ? 100 : indeterminate ? 32 : Math.max(3, pct)) + '%';
+  const elapsed = active && j.started ? (Date.now() / 1000 - j.started) : 0;
+
+  const bits = [];
+  if (active) {
+    if (j.state === 'downloading' && j.bytes_total) {
+      bits.push(`${fmtBytes(bytes)} / ${fmtBytes(j.bytes_total)}`);
+      if (jobSample.rate > 0) bits.push(`${fmtBytes(jobSample.rate)}/s`);
+      const remaining = (j.bytes_total - bytes) / (jobSample.rate || 1);
+      if (jobSample.rate > 0 && remaining > 0) bits.push(`~${fmtDur(remaining)} left`);
+    }
+    if (j.state === 'downloading') { if (pct) bits.push(`${pct}%`); }
+    else if (indeterminate && elapsed > 0) bits.push(`${Math.round(elapsed)}s`);
+    if (j.message && !j.message.startsWith('downloading')) bits.push(j.message);
+  }
+  if (failed) bits.push((j.error || '').split('\n')[0].slice(0, 120));
+  if (readyFlash) bits.push(j.message || 'model is serving');
+  $('#jbNum').textContent = bits.join(' · ');
+
+  $('#jbCancel').hidden = !active;
+  $('#jbLog').hidden = !failed;
+  $('#jbModel').title = j.model || '';
+}
+
+function dismissJobBanner() {
+  jobErrDismissed = true;
+  $('#jobBanner').hidden = true;
+}
+
 /* ------------------------------ chats ------------------------------ */
 function renderChats() {
   const q = $('#chatSearch').value.trim().toLowerCase();
@@ -518,6 +593,74 @@ async function addFiles(files) {
   renderAttachments();
 }
 
+
+/* --------------------------- model switcher --------------------------- */
+async function openModelMenu() {
+  const menu = $('#modelMenu');
+  if (!menu.hidden) { menu.hidden = true; return; }
+  menu.innerHTML = '<div class="m-hint">loading models…</div>';
+  menu.hidden = false;
+  const serving = (state.server && state.server.model) || null;
+  let models = [];
+  try {
+    models = await api('/api/models?source=cache');
+  } catch (e) {
+    menu.innerHTML = `<div class="m-hint">${esc(e.message)}</div>`;
+    return;
+  }
+  const loadable = state.canLoadModels !== false;
+  const rows = models
+    .filter((m) => !/gguf|onnx|embed|rerank|whisper|clip|docling/i.test(m.id))
+    .slice(0, 12)
+    .map((m) => {
+      const cur = m.id === serving;
+      return `<button class="m-item" data-model="${esc(m.id)}" ${cur || !loadable ? 'disabled' : ''}>
+        ${cur ? '<span class="cur"></span>' : '<span style="width:7px"></span>'}
+        <span class="nm">${esc(m.id)}</span>
+        <span class="sz">${m.size_gb ? m.size_gb + ' GB' : ''}${cur ? ' · serving' : ''}</span>
+      </button>`;
+    }).join('');
+
+  menu.innerHTML = `
+    <div class="m-head">Switch model — one click restarts the server</div>
+    ${rows || '<div class="m-hint">No downloaded models found</div>'}
+    ${loadable ? '' : `<div class="m-hint">⚠ model loading is disabled in this deployment (run the host loader)</div>`}
+    <div class="m-sep"></div>
+    <button class="m-item" data-act="search"><span style="width:7px"></span><span class="nm">Search &amp; download models…</span></button>
+    <button class="m-item" data-act="stop" ${state.server && state.server.up ? '' : 'disabled'}>
+      <span style="width:7px"></span><span class="nm">Stop server</span></button>`;
+
+  menu.querySelectorAll('[data-model]').forEach((b) => {
+    b.onclick = () => switchModel(b.dataset.model);
+  });
+  menu.querySelector('[data-act="search"]').onclick = () => { menu.hidden = true; openPanel('model'); };
+  menu.querySelector('[data-act="stop"]').onclick = async () => {
+    menu.hidden = true;
+    await api('/api/server/stop', { method: 'POST', body: {} });
+    toast('Server stopped');
+    refreshState();
+  };
+}
+
+async function switchModel(model) {
+  $('#modelMenu').hidden = true;
+  const payload = {
+    model,
+    context_length: +($('#ctxInput')?.value || state.settings.context_length),
+    mem_fraction_static: +($('#memInput')?.value || state.settings.mem_fraction_static),
+    max_running_requests: +($('#reqInput')?.value || state.settings.max_running_requests),
+    mlx_cache_gb: +($('#cacheInput')?.value || state.settings.mlx_cache_gb),
+  };
+  try {
+    await api('/api/server/start', { method: 'POST', body: payload });
+    toast(`Switching to ${model.split('/').pop()}…`);
+    $('#jobBanner').hidden = false;
+    pollJob();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
 /* ----------------------------- state ----------------------------- */
 const JOB_ACTIVE = ['preparing', 'downloading', 'starting', 'stopping'];
 
@@ -528,6 +671,7 @@ async function refreshState() {
     state.tools = s.tools || [];
     state.server = s.server || {};
     state.job = s.job || {};
+    state.canLoadModels = s.can_load_models !== false;
     const up = !!s.server?.up;
     const jobActive = JOB_ACTIVE.includes(state.job.state);
 
@@ -552,7 +696,10 @@ async function refreshState() {
       $('#jobChip').className = 'chip busy';
       $('#jobChip').textContent = `${state.job.state} ${Math.round(state.job.progress || 0)}%`;
     }
+    if (state.job.state === 'ready' && !jobDoneUntil) jobDoneUntil = Date.now() + 4000;
+    if (JOB_ACTIVE.includes(state.job.state)) jobErrDismissed = false;
     renderServerCard();
+    renderJobBanner();
     applySettingsToForm();
   } catch (e) {
     $('#statusDot').className = 'dot off';
@@ -663,6 +810,8 @@ async function loadModels() {
 }
 
 async function startServer(model) {
+  openPanel('model');
+  $('#jobBanner').hidden = false;
   const payload = {
     model,
     context_length: +$('#ctxInput').value,
@@ -1077,6 +1226,19 @@ function bind() {
   $('#toggleSidebar').onclick = () => $('#sidebar').classList.toggle('open');
   $$('#panelTabs button').forEach((b) => (b.onclick = () => openPanel(b.dataset.tab)));
 
+  $('#modelChip').onclick = (e) => { e.stopPropagation(); openModelMenu(); };
+  document.addEventListener('click', (e) => {
+    const menu = $('#modelMenu');
+    if (!menu || menu.hidden) return;
+    if (!e.target.closest('#modelMenu') && !e.target.closest('#modelChip')) menu.hidden = true;
+  });
+  $('#jbCancel').onclick = async () => {
+    await api('/api/server/cancel', { method: 'POST', body: {} });
+    toast('Cancelling…');
+  };
+  $('#jbLog').onclick = showLogs;
+  $('#jobBanner').onclick = (e) => { if (e.target.closest('button')) return; openPanel('model'); };
+
   // model tab
   $('#modelSearch').onclick = loadModels;
   $('#modelSource').onchange = loadModels;
@@ -1268,6 +1430,7 @@ function bind() {
     if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); }
     if (mod && e.key.toLowerCase() === 'j') { e.preventDefault(); openPanel('params'); }
     if (e.key === 'Escape') {
+      $('#modelMenu').hidden = true;
       closePalette();
       $('#panel').classList.remove('open');
       $('#logsModal').classList.remove('open');
@@ -1284,12 +1447,38 @@ async function boot() {
   await loadChats();
   const recent = state.chats[0];
   if (recent) await openChat(recent.id); else await newChat();
-  setInterval(refreshState, 8000);
+  // model-load progress is polled on its own cheap endpoint, every second
+  setInterval(async () => {
+    try {
+      const j = await api('/api/server/job');
+      const changed = j.state !== state.job.state || j.progress !== state.job.progress;
+      state.job = j;
+      if (changed) {
+        renderJobBanner();
+        renderServerCard();
+        const activeJob = JOB_ACTIVE.includes(j.state);
+        $('#statusDot').className = 'dot ' + (activeJob ? 'busy' : (state.server && state.server.up ? 'on' : 'off'));
+        $('#statusText').textContent = activeJob
+          ? `${j.state} ${j.progress ? Math.round(j.progress) + '%' : ''}`.trim()
+          : (state.server && state.server.up ? `${(state.settings.model || '').split('/').pop()} · up` : 'server down');
+        $('#jobChip').hidden = !activeJob;
+        if (activeJob) { $('#jobChip').className = 'chip busy'; $('#jobChip').textContent = `${j.state} ${Math.round(j.progress || 0)}%`; }
+      }
+    } catch (e) { /* workbench offline */ }
+  }, 1000);
+
+  (async function tick() {
+    try { await refreshState(); } catch (e) { /* offline */ }
+    setTimeout(tick, JOB_ACTIVE.includes(state.job.state) ? 1000 : 8000);
+  })();
 
   const ask = new URLSearchParams(location.search).get('ask');
   if (ask) { await newChat(); sendMessage(ask); }
   const panel = new URLSearchParams(location.search).get('panel');
   if (panel) openPanel(panel);
+  if (new URLSearchParams(location.search).get('menu') === 'models') openModelMenu();
+  const sw = new URLSearchParams(location.search).get('switch');
+  if (sw) switchModel(sw);   // deep link: /?switch=org/model
 }
 
 boot();

@@ -40,6 +40,10 @@ services:
       HF_HOME: /hf-cache
       # Empty => model loading is refused with a clear 501; the host owns the GPU.
       SGLANG_PYTHON: ${SGLANG_PYTHON:-}
+      # Optional host-side loader (loader_agent.py). When set, "Load model" in the
+      # UI works from inside the container: start/stop/job are forwarded to it.
+      WORKBENCH_LOADER_URL: ${WORKBENCH_LOADER_URL:-}
+      WORKBENCH_LOADER_TOKEN: ${WORKBENCH_LOADER_TOKEN:-}
       TZ: ${TZ:-UTC}
     volumes:
       - "${WORKBENCH_DATA_DIR:-./data}:/data"

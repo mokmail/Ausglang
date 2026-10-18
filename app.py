@@ -63,6 +63,10 @@ PORT = int(os.environ.get("WORKBENCH_PORT", "8090"))
 # stack lives on the host) and the API returns a clear error instead of dying.
 PY = os.environ.get("SGLANG_PYTHON") or str(ROOT / ".venv/bin/python")
 HF_CACHE_DIR = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache/huggingface")))
+# Optional host-side loader (loader_agent.py). Set when this app runs in a
+# container: Metal cannot be driven from Linux, so start/stop/job are forwarded.
+LOADER_URL = os.environ.get("WORKBENCH_LOADER_URL", "").rstrip("/")
+LOADER_TOKEN = os.environ.get("WORKBENCH_LOADER_TOKEN", "")
 API_VERSION = "2.0.0"
 CTX_CEILING = 12288   # tested: 12k prefill passes, 16k Metal-OOMs on this box
 
@@ -480,16 +484,35 @@ def _run(cmd: list[str], timeout: float = 20.0) -> subprocess.CompletedProcess |
         return None
 
 
+def loader_call(method: str, path: str, payload: dict | None = None) -> Any:
+    headers = {"X-Loader-Token": LOADER_TOKEN} if LOADER_TOKEN else {}
+    try:
+        r = httpx.request(method, f"{LOADER_URL}{path}", json=payload, headers=headers, timeout=180)
+    except Exception as e:
+        raise HTTPException(502, f"loader unreachable at {LOADER_URL}: {type(e).__name__}: {e}")
+    if r.status_code >= 400:
+        detail = r.text[:400]
+        raise HTTPException(r.status_code, detail)
+    return r.json()
+
+
 def server_up() -> bool:
     try:
-        return httpx.get(f"{UPSTREAM}/health", timeout=2.5).status_code == 200
+        return httpx.get(f"{UPSTREAM}/health", timeout=1.2).status_code == 200
     except Exception:
         return False
 
 
-def server_info() -> dict[str, Any]:
+_INFO_CACHE: dict[str, Any] = {"t": 0.0, "v": {}}
+
+
+def server_info(ttl: float = 2.0) -> dict[str, Any]:
+    """Cheap snapshot: cached for `ttl` so a loading model cannot stall /api/state."""
+    if time.time() - _INFO_CACHE["t"] < ttl and _INFO_CACHE["v"]:
+        return dict(_INFO_CACHE["v"])
     base: dict[str, Any] = {"up": server_up(), "upstream": UPSTREAM}
     if not base["up"]:
+        _INFO_CACHE.update(t=time.time(), v=dict(base))
         return base
     try:
         info = httpx.get(f"{UPSTREAM}/get_server_info", timeout=5).json()
@@ -511,6 +534,7 @@ def server_info() -> dict[str, Any]:
         rss = (ps.stdout.strip() if ps else "")
         if rss.isdigit():
             base["rss_gb"] = round(int(rss) / 2**20, 2)
+    _INFO_CACHE.update(t=time.time(), v=dict(base))
     return base
 
 
@@ -520,7 +544,8 @@ def _download(model: str) -> None:
     detail = model_detail(model)
     expected = max(detail["size_gb"] * 2**30, 1)
     before = cached_models().get(model, 0.0) * 2**30
-    JOB._set(state="downloading", message=f"fetching {model}", progress=0.0)
+    JOB._set(state="downloading", message=f"fetching {model}", progress=0.0,
+             bytes_total=int(expected), bytes_done=int(before))
 
     done: dict[str, Any] = {"err": None}
 
@@ -540,7 +565,8 @@ def _download(model: str) -> None:
         d = HF_CACHE / ("models--" + model.replace("/", "--"))
         now = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.exists() else 0.0
         pct = min(99.0, max(0.0, (now - before) / max(expected - before, 1) * 100))
-        JOB._set(progress=round(pct, 1), message=f"downloading {pct:.0f}%")
+        JOB._set(progress=round(pct, 1), message=f"downloading {pct:.0f}%",
+                 bytes_done=int(now), bytes_total=int(expected))
     if done["err"]:
         raise RuntimeError(done["err"])
     JOB._set(progress=100.0, message="download complete")
@@ -630,12 +656,14 @@ def load_worker(payload: dict[str, Any]) -> None:
 
 
 def start_load(payload: dict[str, Any]) -> dict[str, Any]:
+    if LOADER_URL:
+        return loader_call("POST", "/load", payload)
     if not Path(PY).exists():
         raise HTTPException(
             501,
             "model loading is disabled in this deployment: no SGLang interpreter at "
-            f"{PY}. Start the model server yourself (host or GPU container) and point "
-            "UPSTREAM at it; the rest of the API keeps working.",
+            f"{PY}. Run the host-side loader (loader_agent.py / run-loader.sh) and set "
+            "WORKBENCH_LOADER_URL, or start SGLang yourself and point UPSTREAM at it.",
         )
     if JOB.snapshot()["state"] in ("preparing", "downloading", "starting", "stopping"):
         raise HTTPException(409, "a load is already in progress")
@@ -1072,7 +1100,8 @@ def api_state() -> dict[str, Any]:
         "job": JOB.snapshot(),
         "settings": s,
         "ctx_ceiling": CTX_CEILING,
-        "can_load_models": Path(PY).exists(),
+        "can_load_models": bool(LOADER_URL) or Path(PY).exists(),
+        "loader_url": LOADER_URL or None,
         "tools": tool_schemas() if s.get("tools_enabled") else [],
         "mcp": [
             {"name": c["name"],
@@ -1147,22 +1176,30 @@ def api_server_start(req: ServerStartRequest = Body(...)) -> dict[str, Any]:
 
 @app.get("/api/server/job", tags=["server"], summary="Current load/download job")
 def api_server_job() -> dict[str, Any]:
+    if LOADER_URL:
+        return loader_call("GET", "/job")
     return JOB.snapshot()
 
 
 @app.post("/api/server/cancel", tags=["server"], summary="Cancel the running load")
 def api_server_cancel() -> dict[str, Any]:
+    if LOADER_URL:
+        return loader_call("POST", "/cancel")
     JOB.cancel.set()
     return {"cancelling": True}
 
 
 @app.post("/api/server/stop", tags=["server"], summary="Stop the SGLang process")
 def api_server_stop() -> dict[str, Any]:
+    if LOADER_URL:
+        return loader_call("POST", "/stop")
     return stop_server()
 
 
 @app.get("/api/server/logs", tags=["server"], summary="Tail the SGLang log")
 def api_server_logs(tail: int = 200) -> list[str]:
+    if LOADER_URL:
+        return loader_call("GET", f"/logs?tail={tail}")
     if not SERVER_LOG.exists():
         return []
     lines = SERVER_LOG.read_text(errors="replace").replace("\r", "\n").splitlines()

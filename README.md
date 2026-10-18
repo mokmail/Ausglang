@@ -63,6 +63,31 @@ docker run -d --name sglang-workbench -p 8090:8090 \
 ~/sglang/workbench/run-workbench.sh        # http://localhost:8090
 ```
 
+### Switching models
+
+Click the model chip in the header — one click on any downloaded model restarts
+the server on it. A banner under the header shows the live job (download %,
+bytes, rate, ETA, elapsed, cancel), on every tab, and survives a page reload
+because it is driven by `GET /api/server/job`, not by the click that started it.
+
+Deep links: `/?switch=org/model`, `/?menu=models`, `/?panel=model`.
+
+### Model loading from inside a container
+
+A Linux container cannot drive Metal, so `POST /api/server/start` returns HTTP 501
+there by design. To keep "Load model" working, run the host-side loader and point
+the container at it:
+
+```bash
+./run-loader.sh                                  # host: 0.0.0.0:43441
+WORKBENCH_LOADER_URL=http://<host-ip>:43441 docker compose up -d
+```
+
+The Workbench then forwards `start/stop/cancel/job/logs` to the loader, which
+spawns SGLang on the host where the GPU actually is. Set `LOADER_TOKEN` on the
+host and `WORKBENCH_LOADER_TOKEN` on the container if the loader is reachable
+from other machines.
+
 ### 3. Linux + NVIDIA only: SGLang in its own container
 
 ```bash
@@ -208,6 +233,9 @@ POST   /api/lessons/reflect               extract a lesson from the last exchang
 | `WORKBENCH_CORS_ORIGINS` | `*` | comma-separated allowed origins |
 | `WORKBENCH_ROOT` | `/Users/kmail/sglang` | where `server.log` lives |
 | `SGLANG_PYTHON` | `<root>/.venv/bin/python` | interpreter for model loading |
+| `WORKBENCH_LOADER_URL` | empty | host loader for model switching from a container |
+| `WORKBENCH_LOADER_TOKEN` | empty | `X-Loader-Token` sent to the loader |
+| `LOADER_TOKEN` | empty | require `X-Loader-Token` on the loader |
 | `HF_HOME` | `~/.cache/huggingface` | model cache root (mounted read-only in Docker) |
 
 ---
@@ -248,6 +276,8 @@ workbench/
   Dockerfile           portable image (python:3.11-slim, non-root)
   docker-compose.yml   workbench + optional GPU sglang profile
   run-workbench.sh     host launcher
+  loader_agent.py      host-side model loader (start/stop/job for containers)
+  run-loader.sh        launcher for the loader
   verify-workbench.sh  end-to-end ad-hoc checks
   mcp_demo_server.py   tiny stdio MCP server used by the tests
 ```

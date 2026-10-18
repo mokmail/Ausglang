@@ -55,7 +55,8 @@
       <div class="title-wrap">
         <h1 id="chatTitle">New chat</h1>
         <div class="chips">
-          <span class="chip" id="modelChip">—</span>
+          <button class="chip chip-btn" id="modelChip" title="Switch model">—<svg viewBox="0 0 24 24" class="chev"><path d="M6 9l6 6 6-6"/></svg></button>
+          <div id="modelMenu" class="menu" hidden></div>
           <span class="chip" id="ctxChip">ctx —</span>
           <span class="chip" id="memChip">memory —</span>
           <span class="chip" id="harnessChip">harness —</span>
@@ -77,6 +78,20 @@
         </button>
       </div>
     </header>
+
+
+    <div id="jobBanner" hidden>
+      <div class="jb-row">
+        <span class="jb-dot"></span>
+        <b id="jbState">loading</b>
+        <span id="jbModel" class="jb-model"></span>
+        <span class="grow"></span>
+        <span class="jb-num" id="jbNum"></span>
+        <button class="mini" id="jbCancel">cancel</button>
+        <button class="mini" id="jbLog">log</button>
+      </div>
+      <div class="jb-track"><div class="jb-fill" id="jbFill"></div></div>
+    </div>
 
     <section id="messages"><div class="empty" id="emptyState">
       <div class="empty-logo">S</div>
