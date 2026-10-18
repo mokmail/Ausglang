@@ -410,6 +410,25 @@ def supervisor(interval: float = 15.0) -> None:
             print(f"[supervisor] error: {type(e).__name__}: {e}", flush=True)
 
 
+def adopt_running_engine() -> None:
+    """A restarted loader must not orphan a running engine: adopt it so the supervisor
+    keeps watching it and /memory can report live figures."""
+    if not up():
+        return
+    try:
+        info = httpx.get(f"{UPSTREAM}/get_server_info", timeout=8).json()
+    except Exception:
+        return
+    model = info.get("model_path")
+    if not model:
+        return
+    JOB.last_payload = {"model": model,
+                        "context_length": info.get("context_length"),
+                        "mem_fraction_static": info.get("mem_fraction_static")}
+    JOB.set(state="ready", model=model, progress=100.0, finished=time.time(),
+            message=f"{model} ready (adopted)")
+
+
 def main() -> None:
     global UPSTREAM
     ap = argparse.ArgumentParser()
@@ -419,6 +438,7 @@ def main() -> None:
     a = ap.parse_args()
     UPSTREAM = a.upstream.rstrip("/")
     print(f"loader agent on http://{a.host}:{a.port}  python={PY}  upstream={UPSTREAM}")
+    adopt_running_engine()
     threading.Thread(target=supervisor, daemon=True).start()
     import uvicorn
 
