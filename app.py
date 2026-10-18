@@ -881,6 +881,7 @@ TAGS = [
     {"name": "memory", "description": "Long-term facts injected into the system prompt."},
     {"name": "prompts", "description": "Reusable prompt library."},
     {"name": "personas", "description": "Saved system-prompt + sampling profiles."},
+    {"name": "harness", "description": "Eight-component harness (c1..c8): system prompt, guardrails, memory, tool guidance, subagents, skills, scripts, plugins — plus probes and the lesson library."},
     {"name": "mcp", "description": "stdio MCP servers, tool discovery, manual invocation."},
     {"name": "stats", "description": "Token and message accounting."},
 ]
