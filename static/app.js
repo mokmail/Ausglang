@@ -954,8 +954,49 @@ async function switchModel(model) {
   }
 }
 
+
+/* --------------------------- model load banner --------------------------- */
+function renderJobBanner() {
+  const bar = $('#jobBanner');
+  if (!bar) return;
+  const j = state.job || {};
+  const active = JOB_ACTIVE.includes(j.state);
+  const justFinished = j.state === 'ready' && jobDoneUntil && Date.now() < jobDoneUntil;
+  const failed = j.state === 'failed' && !jobErrDismissed;
+
+  if (!active && !justFinished && !failed) {
+    bar.hidden = true;
+    bar.classList.remove('err', 'done');
+    return;
+  }
+
+  bar.hidden = false;
+  bar.classList.toggle('err', !!failed);
+  bar.classList.toggle('done', !!justFinished);
+  $('#jbState').textContent = failed ? 'failed' : j.state;
+  $('#jbModel').textContent = j.model ? j.model.split('/').pop() : '';
+  $('#jbCancel').hidden = !active;
+
+  const pct = Number(j.progress || 0);
+  const fill = $('#jbFill');
+  // download progress is real; starting/stopping has none — show an indeterminate sweep
+  fill.classList.toggle('indet', active && !['downloading'].includes(j.state));
+  fill.style.width = `${active && j.state === 'downloading' ? pct : Math.max(6, pct)}%`;
+
+  const parts = [];
+  if (j.bytes_total && j.bytes_done && j.state === 'downloading') {
+    parts.push(`${(j.bytes_done / 1e9).toFixed(2)} / ${(j.bytes_total / 1e9).toFixed(1)} GB`);
+  } else if (j.message) {
+    parts.push(j.message);
+  }
+  if (failed && !j.message) parts.push('load failed');
+  $('#jbNum').textContent = parts.join(' · ');
+}
+
 /* ----------------------------- state ----------------------------- */
 const JOB_ACTIVE = ['preparing', 'downloading', 'starting', 'stopping'];
+let jobDoneUntil = 0;      // keep the "ready" banner visible briefly, then fade
+let jobErrDismissed = false;
 
 async function refreshState() {
   try {
@@ -993,8 +1034,10 @@ async function refreshState() {
     if (state.job.state === 'ready' && !jobDoneUntil) jobDoneUntil = Date.now() + 4000;
     if (JOB_ACTIVE.includes(state.job.state)) jobErrDismissed = false;
     // rendering problems are UI problems: they must not flip the connection pill
-    for (const fn of [renderServerCard, renderJobBanner, applySwitchingUI, applySettingsToForm]) {
-      try { fn(); } catch (e) { console.warn('[ui]', fn.name, e && e.message); }
+    for (const name of ['renderServerCard', 'renderJobBanner', 'applySwitchingUI', 'applySettingsToForm']) {
+      const fn = globalThis[name];
+      if (typeof fn !== 'function') continue;
+      try { fn(); } catch (e) { console.warn('[ui]', name, e && e.message); }
     }
   } catch (e) {
     const why = (e && e.message) || String(e);
@@ -1641,6 +1684,10 @@ function bind() {
     toast('Cancelling…');
   };
   $('#jbLog').onclick = showLogs;
+  $('#jobBanner').addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    if (state.job.state === 'failed') { jobErrDismissed = true; renderJobBanner(); }
+  });
   $('#jobBanner').onclick = (e) => { if (e.target.closest('button')) return; openPanel('model'); };
 
   // model tab
@@ -1898,6 +1945,10 @@ async function boot() {
       const j = await api('/api/server/job');
       const changed = j.state !== state.job.state || j.progress !== state.job.progress;
       state.job = j;
+      if (j.state === 'ready' && !jobDoneUntil) jobDoneUntil = Date.now() + 4000;
+      if (JOB_ACTIVE.includes(j.state)) jobErrDismissed = false;
+      if (Date.now() > jobDoneUntil && !JOB_ACTIVE.includes(j.state)) jobDoneUntil = 0;
+      renderJobBanner();
       if (changed) {
         renderJobBanner();
         renderServerCard();
