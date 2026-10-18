@@ -172,11 +172,13 @@ def _note(wgb: float, kv_gb: float, alloc_gb: float, frac: float, free: float,
     return f"{head}; pool ≈ {pool:,} tokens, ctx {ctx:,}"
 
 
-def plan(model: str, ctx_ceiling: int = 12288, reserve_gb: float | None = None) -> dict[str, Any]:
+def plan(model: str, ctx_ceiling: int = 12288, reserve_gb: float | None = None,
+         reclaim_gb: float = 0.0) -> dict[str, Any]:
     """Pick mem-fraction and context length that fit this machine right now.
 
     The reserve covers macOS itself, Docker's VM, the browser and this agent.
-    Everything above it is split between weights and KV cache.
+    Everything above it is split between weights and KV cache. ``reclaim_gb`` is memory the
+    caller knows will be released first — the running engine, which the loader stops.
     """
     snap = snapshot()
     total = snap["total_gb"]
@@ -199,7 +201,8 @@ def plan(model: str, ctx_ceiling: int = 12288, reserve_gb: float | None = None) 
     # free RAM is the honest signal: Metal holds weights outside process RSS, so a
     # running engine looks small while its memory is simply gone. The loader stops the
     # engine before a load, and that is the moment these numbers describe.
-    free = snap["available_gb"]
+    # a model that is about to be replaced gives its whole allocation back
+    free = round(snap["available_gb"] + reclaim_gb, 2)
     headroom = max(0.22, (free - 1.5) / total)
     frac = round(min(0.62, max(0.22, budget / total), headroom), 3)
     alloc_gb = frac * total

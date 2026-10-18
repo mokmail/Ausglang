@@ -286,8 +286,9 @@ GET /memory?model=Qwen/Qwen3-1.7B          # loader (host numbers)
 GET /api/memory                            # workbench, proxied to the loader
 ```
 
-The loader answers with `scope: "host"` (available RAM, swap, pressure, per-process RSS) plus a
-plan; without a loader the workbench falls back to `scope: "container"`, which is the cgroup view
+The loader answers with `scope: "host"` (available RAM, swap, pressure, per-process RSS), the
+live `served` block for the model that is actually running, and a plan only for a model you are
+about to load; without a loader the workbench falls back to `scope: "container"`, which is the cgroup view
 and worth knowing but is not what SGLang competes for. Example on this 24 GB M4 Pro:
 
 ```

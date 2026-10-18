@@ -304,15 +304,44 @@ def load(payload: dict = Body(...)) -> dict[str, Any]:
     return {"accepted": True, "model": payload["model"]}
 
 
-@app.get("/memory", tags=["system"], summary="Host memory and a model sizing plan")
+@app.get("/memory", tags=["system"], summary="Host memory, live engine numbers and a sizing plan")
 def memory(model: str | None = None) -> dict[str, Any]:
     """Unified memory is shared by macOS, Docker and SGLang, so the numbers that
-    matter (available RAM, swap, pressure, per-process RSS) only exist on the host."""
-    target = model or (JOB.last_payload or {}).get("model") or JOB.get().get("model") or ""
+    matter (available RAM, swap, pressure, per-process RSS) only exist on the host.
+
+    For the model that is actually serving, the live figures from /get_server_info are
+    authoritative: a *plan* computed while an engine holds the RAM reads as "does not fit"
+    for a model that is demonstrably running. A plan is only for a model you are about to load.
+    """
+    served: dict[str, Any] = {}
+    if up():
+        try:
+            info = httpx.get(f"{UPSTREAM}/get_server_info", timeout=6).json()
+            served = {
+                "model": info.get("model_path"),
+                "context_length": info.get("context_length"),
+                "max_total_num_tokens": info.get("max_total_num_tokens"),
+                "mem_fraction_static": info.get("mem_fraction_static"),
+            }
+        except Exception:
+            served = {}
+
+    target = model or served.get("model") or (JOB.last_payload or {}).get("model") or ""
+    asking_about_live_model = bool(served) and (not model or model == served.get("model"))
+    # planning a different model: the served one is stopped first, so its allocation is free
+    reclaim = 0.0
+    if served and not asking_about_live_model:
+        snap_total = meminfo.snapshot()["total_gb"]
+        reclaim = round(float(served.get("mem_fraction_static") or 0) * snap_total, 2)
     return {
         "scope": "host",
         "snapshot": meminfo.snapshot(),
-        "plan": meminfo.plan(target) if target else None,
+        "served": served or None,
+        "plan": None if asking_about_live_model else (
+            meminfo.plan(target, reclaim_gb=reclaim) if target else None),
+        "note": ("live engine figures — stop the model to plan a different one"
+                 if asking_about_live_model else
+                 "plan for the next load; the engine is stopped before it starts"),
     }
 
 
