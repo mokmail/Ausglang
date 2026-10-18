@@ -25,9 +25,7 @@ button svg,.icon-btn svg,.search svg,.mini svg,.brand svg,.chip-btn svg{
 /* layout variables are written by the UI-state module (persisted) */
 :root{--side-w:288px;--panel-w:410px;--measure:830px;--msg-gap:20px;--chat-pad:26px}
 #app{display:grid;grid-template-columns:var(--side-w) 1fr;height:100%;position:relative}
-#app.with-panel{grid-template-columns:var(--side-w) 1fr var(--panel-w)}
 #app.no-side{grid-template-columns:0 1fr}
-#app.no-side.with-panel{grid-template-columns:0 1fr var(--panel-w)}
 
 /* drag handles */
 .resizer{position:relative;width:0;cursor:col-resize;z-index:30}
@@ -36,6 +34,8 @@ button svg,.icon-btn svg,.search svg,.mini svg,.brand svg,.chip-btn svg{
 .resizer.side{grid-column:1;justify-self:end}
 
 @media(min-width:1360px){
+  #app.with-panel{grid-template-columns:var(--side-w) 1fr var(--panel-w)}
+  #app.no-side.with-panel{grid-template-columns:0 1fr var(--panel-w)}
   /* the panel stops being an overlay: it becomes the third column */
   #panel{position:relative;transform:none;width:auto;height:100%;min-width:0;
     border-left:1px solid var(--line);background:var(--panel);display:none;
@@ -460,3 +460,12 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
 .html-preview{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--bg2)}
 .html-preview iframe{min-height:56px;border-radius:0 0 9px 9px}
 .html-preview .hp-head{border-bottom:1px solid var(--line)}
+
+[hidden]{display:none !important}
+
+#jobBanner{position:relative;z-index:5}
+.jb-track{max-width:none;margin:0 0 6px}
+@media(max-width:1080px){
+  #jobBanner{padding:8px 12px}
+  .jb-num{display:none}
+}
