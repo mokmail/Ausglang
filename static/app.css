@@ -281,10 +281,11 @@ input[type=range]{width:100%;accent-color:var(--accent);margin:2px 0}
 }
 
 /* model-load banner: visible on every tab, mirrors /api/server/job */
-#jobBanner{border-bottom:1px solid var(--line);background:linear-gradient(90deg,
-  color-mix(in srgb,var(--accent) 10%, var(--panel)), var(--panel) 60%);padding:8px 20px 0}
-#jobBanner.err{background:linear-gradient(90deg, rgba(248,113,113,.14), var(--panel) 60%)}
-#jobBanner.done{background:linear-gradient(90deg, rgba(74,222,128,.16), var(--panel) 60%)}
+#jobBanner{border-bottom:1px solid var(--line);
+  background:color-mix(in srgb,var(--accent) 8%, var(--bg));padding:8px 20px 0;
+  position:sticky;top:0;z-index:6;backdrop-filter:blur(6px)}
+#jobBanner.err{background:color-mix(in srgb, var(--danger) 12%, var(--bg))}
+#jobBanner.done{background:color-mix(in srgb, var(--accent) 10%, var(--bg))}
 .jb-row{display:flex;align-items:center;gap:10px;font-size:12.6px;color:var(--fg-dim);
   max-width:830px;margin:0 auto;padding-bottom:7px}
 .jb-row .grow{flex:1}
@@ -468,4 +469,17 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
 @media(max-width:1080px){
   #jobBanner{padding:8px 12px}
   .jb-num{display:none}
+}
+
+@media(max-width:1359px){
+  #app.with-panel::before{content:"";position:fixed;inset:0;background:rgba(0,0,0,.42);
+    z-index:39;backdrop-filter:blur(1px)}
+  #panel{z-index:40}
+}
+@media(max-width:1200px){
+  #app{grid-template-columns:0 1fr}
+  #sidebar{position:fixed;left:0;top:0;bottom:0;width:288px;transform:translateX(-100%);
+    transition:.22s;z-index:45}
+  #sidebar.open{transform:none}
+  .only-mobile{display:inline-flex}
 }
