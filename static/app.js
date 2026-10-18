@@ -84,7 +84,7 @@ function configureMarked() {
     /^(https?:|data:image\/)/i.test(href || '')
       ? `<img src="${esc(href)}" alt="${esc(text || '')}" title="${esc(title || '')}" loading="lazy">`
       : `<span class="muted">[image blocked: ${esc(href || '')}]</span>`;
-  window.marked.use({ renderer, gfm: true, breaks: true, headerIds: false, mangle: false });
+  window.marked.use({ renderer, gfm: true, breaks: false, headerIds: false, mangle: false });
   window.marked.__configured = true;
 }
 
@@ -659,11 +659,16 @@ function attachHtmlPreviews(scope) {
     const wrap = document.createElement('div');
     wrap.className = 'html-preview';
     wrap.innerHTML = `<div class="hp-head"><span>sandboxed preview</span><span class="grow"></span>
-      <button class="mini">toggle</button></div><iframe sandbox="allow-scripts" loading="lazy"></iframe>`;
+      <button class="mini">hide</button></div><iframe sandbox="allow-scripts" loading="lazy"></iframe>`;
     const frame = wrap.querySelector('iframe');
-    frame.srcdoc = pre.dataset.code;
-    frame.hidden = true;
-    wrap.querySelector('button').onclick = () => { frame.hidden = !frame.hidden; };
+    const probe = `<script>addEventListener('load',()=>{const h=Math.min(1200,Math.max(60,document.documentElement.scrollHeight));
+      parent.postMessage({__htmlPreview:1,h},'*')});<\/script>`;
+    frame.srcdoc = pre.dataset.code + probe;
+    frame.style.height = '90px';
+    wrap.querySelector('button').onclick = () => {
+      frame.hidden = !frame.hidden;
+      wrap.querySelector('button').textContent = frame.hidden ? 'show' : 'hide';
+    };
     pre.after(wrap);
   });
 }
@@ -1292,6 +1297,15 @@ async function showStats() {
   }).join('') || '<div class="muted">No usage yet</div>';
   $('#statsModal').classList.add('open');
 }
+
+window.addEventListener('message', (e) => {
+  const d = e.data;
+  if (d && d.__htmlPreview && typeof d.h === 'number') {
+    document.querySelectorAll('.html-preview iframe').forEach((f) => {
+      if (f.contentWindow === e.source) f.style.height = Math.min(1200, Math.max(60, d.h + 8)) + 'px';
+    });
+  }
+});
 
 /* --------------------------- command palette --------------------------- */
 function paletteItems() {
