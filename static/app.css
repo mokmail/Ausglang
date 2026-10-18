@@ -433,3 +433,23 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
   max-height:320px;overflow:auto}
 .think-body p:last-child{margin-bottom:0}
 .think[open] .th-dots{display:none}
+
+/* ---------- scrollbars, column polish ---------- */
+*{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--fg-mute) 45%, transparent) transparent}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--fg-mute) 40%, transparent);
+  border-radius:8px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--accent) 55%, transparent);background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+
+@media(min-width:1360px){
+  #main{border-right:1px solid var(--line)}
+  #app.with-panel #main{border-right:0}
+  #panel .panel-head{position:sticky;top:0;background:var(--panel);z-index:2}
+  #panel .tabs{overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}
+  #panel .tabs::-webkit-scrollbar{display:none}
+}
+#panel.open{display:flex;flex-direction:column}
+.panel-body{overflow-y:auto;flex:1;min-height:0}
+.icon-btn.on{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%, var(--line))}

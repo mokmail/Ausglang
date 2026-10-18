@@ -992,10 +992,10 @@ async function refreshState() {
     }
     if (state.job.state === 'ready' && !jobDoneUntil) jobDoneUntil = Date.now() + 4000;
     if (JOB_ACTIVE.includes(state.job.state)) jobErrDismissed = false;
-    renderServerCard();
-    renderJobBanner();
-    applySwitchingUI();
-    applySettingsToForm();
+    // rendering problems are UI problems: they must not flip the connection pill
+    for (const fn of [renderServerCard, renderJobBanner, applySwitchingUI, applySettingsToForm]) {
+      try { fn(); } catch (e) { console.warn('[ui]', fn.name, e && e.message); }
+    }
   } catch (e) {
     $('#statusDot').className = 'dot off';
     $('#statusText').textContent = 'workbench offline';
@@ -1032,28 +1032,32 @@ function renderServerCard() {
   $('#stopServer').disabled = !up && !active;
 }
 
+function setVal(sel, v) { const el = $(sel); if (el) el.value = v; }
+function setCheck(sel, v) { const el = $(sel); if (el) el.checked = !!v; }
+function setTxt(sel, v) { const el = $(sel); if (el) el.textContent = v; }
+
 function applySettingsToForm() {
-  const s = state.settings;
-  $('#ctxInput').value = s.context_length;
-  $('#memInput').value = s.mem_fraction_static;
-  $('#reqInput').value = s.max_running_requests;
-  $('#cacheInput').value = s.mlx_cache_gb;
-  $('#sysPrompt').value = s.system_prompt || '';
-  $('#tempRange').value = s.temperature; $('#tempVal').textContent = s.temperature;
-  $('#toppRange').value = s.top_p; $('#toppVal').textContent = s.top_p;
-  $('#topkRange').value = s.top_k; $('#topkVal').textContent = s.top_k;
-  $('#maxtokRange').value = s.max_tokens; $('#maxtokVal').textContent = s.max_tokens;
-  $('#repRange').value = s.repeat_penalty; $('#repVal').textContent = s.repeat_penalty;
-  $('#roundsRange').value = s.max_tool_rounds; $('#roundsVal').textContent = s.max_tool_rounds;
-  $('#seedInput').value = s.seed ?? '';
-  $('#stopInput').value = Array.isArray(s.stop) ? s.stop.join(',') : (s.stop || '');
-  $('#memEnabled').checked = !!s.memory_enabled;
-  $('#toolsEnabled').checked = !!s.tools_enabled;
-  $('#thinkEnabled').checked = !!s.enable_thinking;
-  $('#jsonEnabled').checked = !!s.json_mode;
-  $('#streamEnabled').checked = !!s.stream;
-  $('#autoTitleEnabled').checked = !!s.auto_title;
-  updateCtxWarn();
+  const s = state.settings || {};
+  setVal('#ctxInput', s.context_length);
+  setVal('#memInput', s.mem_fraction_static);
+  setVal('#reqInput', s.max_running_requests);
+  setVal('#cacheInput', s.mlx_cache_gb);
+  setVal('#sysPrompt', s.system_prompt || '');
+  setVal('#tempRange', s.temperature); setTxt('#tempVal', s.temperature);
+  setVal('#toppRange', s.top_p); setTxt('#toppVal', s.top_p);
+  setVal('#topkRange', s.top_k); setTxt('#topkVal', s.top_k);
+  setVal('#maxtokRange', s.max_tokens); setTxt('#maxtokVal', s.max_tokens);
+  setVal('#repRange', s.repeat_penalty); setTxt('#repVal', s.repeat_penalty);
+  setVal('#roundsRange', s.max_tool_rounds); setTxt('#roundsVal', s.max_tool_rounds);
+  setVal('#seedInput', s.seed ?? '');
+  setVal('#stopInput', Array.isArray(s.stop) ? s.stop.join(',') : (s.stop || ''));
+  setCheck('#memEnabled', s.memory_enabled);
+  setCheck('#toolsEnabled', s.tools_enabled);
+  setCheck('#thinkEnabled', s.enable_thinking);
+  setCheck('#jsonEnabled', s.json_mode);
+  setCheck('#streamEnabled', s.stream);
+  setCheck('#autoTitleEnabled', s.auto_title);
+  try { updateCtxWarn(); } catch (e) { /* panel not rendered yet */ }
 }
 
 function updateCtxWarn() {
