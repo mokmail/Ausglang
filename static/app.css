@@ -453,3 +453,10 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
 #panel.open{display:flex;flex-direction:column}
 .panel-body{overflow-y:auto;flex:1;min-height:0}
 .icon-btn.on{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%, var(--line))}
+
+/* no stray horizontal scrollbars; wide content scrolls inside its own block */
+#messages{overflow-x:hidden}
+.thread{min-width:0}
+.html-preview{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--bg2)}
+.html-preview iframe{min-height:56px;border-radius:0 0 9px 9px}
+.html-preview .hp-head{border-bottom:1px solid var(--line)}
