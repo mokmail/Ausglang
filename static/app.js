@@ -49,6 +49,18 @@ async function api(path, opts = {}) {
 
 const LANG_ALIASES = { js: 'javascript', ts: 'typescript', py: 'python', sh: 'bash', yml: 'yaml', md: 'markdown' };
 
+/* Models that inline their chain of thought: move it into the reasoning block. */
+function splitThink(msg) {
+  let text = msg.content || '';
+  const m = text.match(/^\s*<think(?:ing)?>([\s\S]*?)<\/(?:think|thinking)>\s*/i);
+  if (m) {
+    if (!msg.reasoning) msg.reasoning = m[1].trim();
+    text = text.slice(m[0].length);
+  }
+  text = text.replace(/<\/?(?:think|thinking)>/gi, '');
+  return text;
+}
+
 function codeBlock(code, infostring = '') {
   if (!code || !code.trim()) return '';   // a model that emits empty fences should not draw empty boxes
   const rawLang = (infostring || '').trim().split(/\s+/)[0].toLowerCase();
@@ -378,9 +390,12 @@ async function sendMessage(textOverride) {
   $('#messages .thread').appendChild(aEl);
   const bodyEl = aEl.querySelector('.body');
   bodyEl.innerHTML = '<span class="cursor"></span>';
-  const thinkEl = document.createElement('div');
+  const thinkEl = document.createElement('details');
   thinkEl.className = 'think';
+  thinkEl.open = true;
+  thinkEl.innerHTML = '<summary><span class="th-label">thinking</span><span class="th-dots">…</span></summary><div class="think-body"></div>';
   thinkEl.style.display = 'none';
+  const thinkBody = thinkEl.querySelector('.think-body');
   aEl.querySelector('.bubble').prepend(thinkEl);
 
   state.streaming = true;
@@ -426,7 +441,7 @@ async function sendMessage(textOverride) {
         } else if (ev === 'reasoning') {
           assistant.reasoning += data.text;
           thinkEl.style.display = 'block';
-          thinkEl.textContent = assistant.reasoning;
+          thinkBody.innerHTML = md(assistant.reasoning);
         } else if (ev === 'tool') {
           if (data.state === 'running') {
             const tl = document.createElement('div');
@@ -839,9 +854,15 @@ function renderServerCard() {
   const up = !!s.up;
   $('#scDot').className = 'dot ' + (JOB_ACTIVE.includes(j.state) ? 'busy' : up ? 'on' : 'off');
   $('#scModel').textContent = s.model || state.settings.model || '—';
+  const pool = Number(s.max_total_num_tokens || 0);
+  const poolTxt = pool ? ` · pool ${pool.toLocaleString()} tok` : '';
   $('#scMeta').textContent = up
-    ? `ctx ${Number(s.context_length || 0).toLocaleString()} · pool ${Number(s.max_total_num_tokens || 0).toLocaleString()} tok · RSS ${s.rss_gb ?? '?'} GB`
+    ? `ctx ${Number(s.context_length || 0).toLocaleString()}${poolTxt} · RSS ${s.rss_gb ?? '?'} GB`
     : (j.state !== 'idle' ? `${j.state}: ${j.message || ''}` : 'server not running');
+  $('#scMeta').classList.toggle('warn', up && pool > 0 && pool < 4096);
+  $('#scMeta').title = up && pool > 0 && pool < 4096
+    ? 'KV pool is too small for real conversations — lower the context window or pick a smaller model'
+    : '';
 
   const prog = $('#loadProgress');
   const bar = $('#loadBar');

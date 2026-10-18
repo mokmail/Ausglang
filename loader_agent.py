@@ -152,6 +152,22 @@ def download(model: str) -> None:
     JOB.set(progress=100.0, message="download complete")
 
 
+OOM_MARKERS = ("Insufficient Memory", "OutOfMemory", "out of memory")
+
+
+def _oom_retry(payload: dict[str, Any], tail: str) -> dict[str, Any] | None:
+    """Halve the context once when Metal ran out of memory, else None."""
+    if not any(m.lower() in tail.lower() for m in OOM_MARKERS):
+        return None
+    if payload.get("_oom_retried"):
+        return None
+    ctx = int(payload.get("context_length") or CTX_CEILING)
+    smaller = max(4096, ctx // 2)
+    if smaller >= ctx:
+        return None
+    return {**payload, "context_length": smaller, "_oom_retried": True}
+
+
 def worker(payload: dict[str, Any]) -> None:
     model = payload["model"]
     JOB.cancel.clear()
@@ -211,13 +227,54 @@ def worker(payload: dict[str, Any]) -> None:
                 JOB.set(state="cancelled", message="cancelled by user")
                 return
             if up():
+                info: dict[str, Any] = {}
+                try:
+                    info = httpx.get(f"{UPSTREAM}/get_server_info", timeout=8).json()
+                except Exception:
+                    pass
+                pool = int(info.get("max_total_num_tokens") or 0)
+                ctx = int(payload.get("context_length") or CTX_CEILING)
+                if 0 < pool < min(4096, ctx) and not payload.get("_pool_fitted"):
+                    frac = min(0.55, float(payload.get("mem_fraction_static") or 0.30) + 0.15)
+                    fitted = {**payload, "mem_fraction_static": frac,
+                              "context_length": min(ctx, 8192), "_pool_fitted": True}
+                    print(f"[loader] KV pool only {pool} tokens at ctx {ctx}; retrying with "
+                          f"mem-fraction {frac:.2f} ctx {fitted['context_length']}", flush=True)
+                    JOB.set(state="starting",
+                            message=f"KV pool only {pool} tokens — refitting (mem {frac:.2f}, ctx {fitted['context_length']})")
+                    _run(["pkill", "-f", "sglang.launch_server --model-path"])
+                    for _ in range(30):
+                        if not up():
+                            break
+                        time.sleep(1)
+                    _run(["pkill", "-9", "-f", "sglang.launch_server --model-path"])
+                    time.sleep(2)
+                    return worker(fitted)
                 JOB.last_payload = dict(payload)
-                JOB.set(state="ready", message=f"{model} ready", finished=time.time())
+                JOB.set(state="ready",
+                        message=f"{model} ready" + (f" · pool {pool:,} tok" if pool else ""),
+                        finished=time.time(), pool=pool, context_length=ctx)
                 return
             if JOB.proc and JOB.proc.poll() is not None:
-                raise RuntimeError("server exited during startup:\n" + log_tail())
+                tail = log_tail(40)
+                retry = _oom_retry(payload, tail)
+                if retry:
+                    JOB.set(state="starting", message=f"out of memory at ctx {payload.get('context_length')} — retrying with {retry['context_length']}")
+                    print(f"[loader] OOM at ctx {payload.get('context_length')}; retrying with {retry['context_length']}", flush=True)
+                    return worker(retry)
+                if any(m.lower() in tail.lower() for m in OOM_MARKERS):
+                    raise RuntimeError(
+                        "out of memory: Metal could not allocate this model at this context size. "
+                        f"Retry with a smaller context (<= {max(4096, int(payload.get('context_length') or 12288) // 2)}), "
+                        "a smaller model, or a larger machine.\n" + tail[-800:])
+                raise RuntimeError("server exited during startup:\n" + tail)
             time.sleep(2)
-        raise RuntimeError("timed out waiting for /health:\n" + log_tail())
+        tail = log_tail(40)
+        retry = _oom_retry(payload, tail)
+        if retry:
+            JOB.set(state="starting", message=f"out of memory — retrying with ctx {retry['context_length']}")
+            return worker(retry)
+        raise RuntimeError("timed out waiting for /health:\n" + tail)
     except Exception as e:  # noqa: BLE001
         JOB.set(state="failed", error=str(e)[:4000], message="load failed", finished=time.time())
 
@@ -292,6 +349,16 @@ def supervisor(interval: float = 15.0) -> None:
                 if running:
                     continue
             if not up():
+                tail = log_tail(40)
+                retry = _oom_retry(payload, tail)
+                if retry:
+                    retry["max_running_requests"] = 1
+                    print(f"[supervisor] OOM crash — restarting {payload['model']} at ctx "
+                          f"{retry['context_length']} with 1 concurrent request", flush=True)
+                    JOB.last_payload = retry
+                    JOB.cancel.clear()
+                    worker(dict(retry))
+                    continue
                 print(f"[supervisor] {payload['model']} down — restarting", flush=True)
                 JOB.cancel.clear()
                 worker(dict(payload))

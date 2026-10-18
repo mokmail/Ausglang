@@ -388,3 +388,17 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
 /* inline SVG content keeps its own geometry */
 .body svg,.mermaid-wrap svg{width:auto;height:auto;max-width:100%;fill:initial;stroke:none}
 .mermaid-wrap svg{display:block;margin:0 auto}
+
+.sc-meta.warn{color:var(--warn)}
+
+/* reasoning block */
+.think{margin:0 0 .7em;border:1px solid var(--line);border-radius:10px;background:color-mix(in srgb,var(--panel) 60%, transparent)}
+.think summary{cursor:pointer;list-style:none;padding:7px 11px;font-size:11.5px;letter-spacing:.04em;
+  text-transform:uppercase;color:var(--fg-mute);display:flex;gap:8px;align-items:center}
+.think summary::-webkit-details-marker{display:none}
+.think summary:hover{color:var(--fg-dim)}
+.think[open] summary{border-bottom:1px solid var(--line)}
+.think-body{padding:9px 12px;font-size:13.2px;line-height:1.6;color:var(--fg-dim);
+  max-height:320px;overflow:auto}
+.think-body p:last-child{margin-bottom:0}
+.think[open] .th-dots{display:none}

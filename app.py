@@ -609,6 +609,17 @@ def _log_tail(n: int = 25) -> str:
     return "\n".join(lines[-n:])
 
 
+OOM_MARKERS = ("Insufficient Memory", "OutOfMemory", "out of memory")
+
+
+def _oom_retry(payload: dict[str, Any], tail: str) -> dict[str, Any] | None:
+    if not any(m.lower() in tail.lower() for m in OOM_MARKERS) or payload.get("_oom_retried"):
+        return None
+    ctx = int(payload.get("context_length") or CTX_CEILING)
+    smaller = max(4096, ctx // 2)
+    return {**payload, "context_length": smaller, "_oom_retried": True} if smaller < ctx else None
+
+
 def load_worker(payload: dict[str, Any]) -> None:
     model = payload["model"]
     settings = load_settings()
@@ -656,7 +667,12 @@ def load_worker(payload: dict[str, Any]) -> None:
                 JOB._set(state="ready", message=f"{model} ready", finished=time.time())
                 return
             if JOB.proc and JOB.proc.poll() is not None:
-                raise RuntimeError("server exited during startup:\n" + _log_tail(20))
+                tail = _log_tail(40)
+                retry = _oom_retry(payload, tail)
+                if retry:
+                    JOB._set(state="starting", message=f"out of memory — retrying with ctx {retry['context_length']}")
+                    return load_worker(retry)
+                raise RuntimeError("server exited during startup:\n" + tail)
             time.sleep(2)
         raise RuntimeError("timed out waiting for /health:\n" + _log_tail(20))
     except Exception as e:
