@@ -273,6 +273,30 @@ On NVIDIA, raise it freely (`--mem-fraction-static 0.85`).
 
 ---
 
+## Layout and remembered state
+
+The workspace is a real three-column layout, not a chat page with a drawer:
+
+| viewport | layout |
+|---|---|
+| ≥ 1360 px | sidebar · chat · panel — the panel is a grid column with a drag handle (320–760 px) |
+| 1200–1359 px | sidebar · chat, panel opens as an overlay with a dim scrim (click it to close) |
+| < 1200 px | chat only, sidebar behind a hamburger, panel still overlays |
+
+Drag either handle to resize; double-click a handle to reset it to its default. The density
+button in the topbar switches comfortable/compact spacing.
+
+Everything you change is remembered twice — `localStorage` for an instant restore on the next
+paint, and `POST /api/ui-state` for durability across browsers, container rebuilds and other
+machines on the LAN:
+
+* open chat, scroll position per chat, composer draft per chat
+* panel open/closed, active panel tab, sidebar width, panel width, density, theme
+* model browser filters (source, task, query)
+
+`GET /api/ui-state` returns the stored blob, so a fresh browser profile opens exactly where the
+last one left off.
+
 ## Rendering
 
 Answers are parsed with **marked** (CommonMark + GFM) and sanitised with **DOMPurify**;
