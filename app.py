@@ -1886,10 +1886,15 @@ async def api_extract(file: UploadFile = File(...)) -> dict[str, Any]:
           summary="Upload a document into the chat: stores the original and returns extracted text")
 async def api_upload(chat_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
     data = await file.read()
+    if not data:
+        raise HTTPException(400, "the uploaded file is empty")
     if len(data) > 25 * 1024 * 1024:
         raise HTTPException(413, "file larger than 25 MB")
-    name = file.filename or "upload"
-    text, meta = extract_document(name, data)
+    name = Path(file.filename or "upload").name
+    try:
+        text, meta = extract_document(name, data)
+    except Exception as exc:  # a corrupt or unsupported document must not 500
+        raise HTTPException(400, f"could not read {name}: {type(exc).__name__}: {str(exc)[:200]}") from exc
     art = save_artifact(chat_id, name, data, mime=(file.content_type or "application/octet-stream"))
     return {"artifact": art, "name": name, "size": len(data), "chars": len(text), **meta, "text": text}
 
