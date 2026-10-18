@@ -1772,6 +1772,9 @@ async function boot() {
     setTimeout(tick, JOB_ACTIVE.includes(state.job.state) ? 1000 : 8000);
   })();
 
+  const chatParam = new URLSearchParams(location.search).get('chat');
+  if (chatParam && state.chats.some((c) => c.id === chatParam)) await openChat(chatParam);
+
   const ask = new URLSearchParams(location.search).get('ask');
   if (ask) { await newChat(); sendMessage(ask); }
   const panel = new URLSearchParams(location.search).get('panel');
