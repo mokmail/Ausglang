@@ -645,6 +645,7 @@ def load_worker(payload: dict[str, Any]) -> None:
                     mlx_cache_gb=cfg.get("mlx_cache_gb", 1.0),
                 )
                 save_settings(settings)
+                _INFO_CACHE.update(t=0.0, v={})   # drop the stale pre-load snapshot
                 JOB._set(state="ready", message=f"{model} ready", finished=time.time())
                 return
             if JOB.proc and JOB.proc.poll() is not None:
