@@ -127,6 +127,8 @@ function applyLayout() {
   app.classList.toggle('with-panel', !!s.panel);
   $('#panel').classList.toggle('open', !!s.panel);
   $('#panelResize').hidden = !s.panel;
+  const scrimEl = $('#scrim');
+  if (scrimEl) scrimEl.hidden = !s.panel;
   $('#sideResize').hidden = !s.sidebar;
   const btn = $('#densityBtn');
   if (btn) btn.classList.toggle('on', s.density === 'compact');
@@ -168,6 +170,15 @@ function bindLayout() {
     },
     onEnd: () => UI.save(),
   });
+
+  const scrim = $('#scrim');
+  if (scrim) scrim.onclick = () => {
+    $('#panel').classList.remove('open');
+    $('#app').classList.remove('with-panel');
+    $('#panelResize').hidden = true;
+    scrim.hidden = true;
+    UI.set({ panel: false });
+  };
 
   $('#panelResize').addEventListener('dblclick', () => { UI.set({ panelW: 410 }); applyLayout(); });
   $('#sideResize').addEventListener('dblclick', () => { UI.set({ sideW: 288 }); applyLayout(); });
@@ -1590,6 +1601,7 @@ function openPanel(tab = 'model') {
   UI.set({ panel: true, tab });
   $('#app').classList.add('with-panel');
   $('#panelResize').hidden = false;
+  if ($('#scrim')) $('#scrim').hidden = false;
   $('#panel').classList.add('open');
   $$('#panelTabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $$('.tab-pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
