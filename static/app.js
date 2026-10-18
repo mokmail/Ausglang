@@ -44,174 +44,65 @@ async function api(path, opts = {}) {
 }
 
 /* ----------------------------- markdown ----------------------------- */
-const KEYWORDS = /\b(def|class|return|if|else|elif|for|while|try|except|finally|import|from|as|with|lambda|yield|async|await|const|let|var|function|new|this|throw|catch|switch|case|break|continue|True|False|None|null|true|false|undefined|public|private|static|void|int|float|str|bool|list|dict)\b/g;
+/* Rendered with marked (CommonMark + GFM), sanitised with DOMPurify, code
+   highlighted with highlight.js. Everything is vendored: no network. */
 
-function highlight(code, lang) {
-  let h = esc(code);
-  h = h.replace(/(&quot;|&#39;|`)(?:(?!\1).)*\1/g, (m) => `<span class="tok-str">${m}</span>`);
-  h = h.replace(/(^|\s)(#|\/\/)(.*)$/gm, '$1<span class="tok-com">$2$3</span>');
-  h = h.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="tok-num">$1</span>');
-  if (['py', 'python', 'js', 'javascript', 'ts', 'tsx', 'rs', 'go', 'java', 'c', 'cpp', 'sh', 'bash', ''].includes(lang)) {
-    h = h.replace(KEYWORDS, '<span class="tok-kw">$1</span>');
+const LANG_ALIASES = { js: 'javascript', ts: 'typescript', py: 'python', sh: 'bash', yml: 'yaml', md: 'markdown' };
+
+function codeBlock(code, infostring = '') {
+  const rawLang = (infostring || '').trim().split(/\s+/)[0].toLowerCase();
+  const lang = LANG_ALIASES[rawLang] || rawLang;
+  if (rawLang === 'mermaid') {
+    return `<div class="mermaid-wrap" data-mermaid="${esc(code)}"><pre class="mermaid-src" hidden>${esc(code)}</pre></div>`;
   }
-  return h;
+  let body;
+  if (window.hljs && lang && window.hljs.getLanguage(lang)) {
+    try {
+      body = window.hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+    } catch (e) {
+      body = esc(code);
+    }
+  } else if (window.hljs) {
+    try { body = window.hljs.highlightAuto(code).value; } catch (e) { body = esc(code); }
+  } else {
+    body = esc(code);
+  }
+  return `<pre data-code="${esc(code)}"><code class="hljs" data-lang="${esc(rawLang)}">${body}</code></pre>`;
+}
+
+function configureMarked() {
+  if (!window.marked || window.marked.__configured) return;
+  const renderer = new window.marked.Renderer();
+  renderer.code = (code, infostring) => codeBlock(code, infostring);
+  renderer.codespan = (code) => `<code class="inline">${esc(code)}</code>`;
+  renderer.link = (href, title, text) => {
+    const safe = /^(https?:|mailto:|#)/i.test(href || '') ? href : '#';
+    return `<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+  };
+  renderer.image = (href, title, text) =>
+    /^(https?:|data:image\/)/i.test(href || '')
+      ? `<img src="${esc(href)}" alt="${esc(text || '')}" title="${esc(title || '')}" loading="lazy">`
+      : `<span class="muted">[image blocked: ${esc(href || '')}]</span>`;
+  window.marked.use({ renderer, gfm: true, breaks: true, headerIds: false, mangle: false });
+  window.marked.__configured = true;
 }
 
 function md(src) {
   if (!src) return '';
-  const blocks = [];
-  let text = String(src).replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-    blocks.push({ lang, code });
-    return `\u0000BLOCK${blocks.length - 1}\u0000`;
+  if (!window.marked || !window.DOMPurify) return `<pre data-code="${esc(src)}"><code>${esc(src)}</code></pre>`;
+  configureMarked();
+  let html;
+  try {
+    html = window.marked.parse(String(src));
+  } catch (e) {
+    return `<pre>${esc(String(src))}</pre>`;
+  }
+  return window.DOMPurify.sanitize(html, {
+    ADD_ATTR: ['target', 'rel', 'data-lang', 'data-code', 'data-mermaid', 'class', 'loading', 'hidden'],
+    FORBID_TAGS: ['script', 'style', 'object', 'embed', 'form'],
+    FORBID_ATTR: ['onerror', 'onload', 'onclick', 'srcdoc'],
+    ALLOW_DATA_ATTR: true,
   });
-
-  text = esc(text);
-  text = text.replace(/^###### (.*)$/gm, '<h3>$1</h3>')
-             .replace(/^##### (.*)$/gm, '<h3>$1</h3>')
-             .replace(/^#### (.*)$/gm, '<h3>$1</h3>')
-             .replace(/^### (.*)$/gm, '<h3>$1</h3>')
-             .replace(/^## (.*)$/gm, '<h2>$1</h2>')
-             .replace(/^# (.*)$/gm, '<h1>$1</h1>')
-             .replace(/^\s*---+\s*$/gm, '<hr>')
-             .replace(/^&gt; ?(.*)$/gm, '<blockquote>$1</blockquote>');
-  text = text.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  text = text.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
-
-  // pipe tables
-  const lines = text.split('\n');
-  const tbl = [];
-  for (let i = 0; i < lines.length; i++) {
-    const head = lines[i];
-    const sep = lines[i + 1] || '';
-    if (head.includes('|') && /^\s*\|?[\s:-]*-[\s|:-]*$/.test(sep)) {
-      const parse = (row) => row.replace(/^\s*\||\|\s*$/g, '').split('|').map((c) => c.trim());
-      const start = i;
-      let html = '<table><thead><tr>' + parse(head).map((h) => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
-      i += 2;
-      while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
-        html += '<tr>' + parse(lines[i]).map((c) => `<td>${c}</td>`).join('') + '</tr>';
-        i++;
-      }
-      const end = Math.min(i - 1, lines.length - 1);
-      tbl.push(html + '</tbody></table>');
-      lines[start] = `\u0000TBL${tbl.length - 1}\u0000`;
-      for (let k = start + 1; k <= end; k++) lines[k] = '';
-      i = end;
-    }
-  }
-  text = lines.join('\n');
-
-  const out = [];
-  let list = null;
-  for (const line of text.split('\n')) {
-    const m = line.match(/^\s*(?:[-*+]|(\d+)\.)\s+(.*)$/);
-    if (m) {
-      const ordered = !!m[1];
-      if (!list || list.ordered !== ordered) {
-        if (list) out.push(`</${list.ordered ? 'ol' : 'ul'}>`);
-        list = { ordered };
-        out.push(`<${ordered ? 'ol' : 'ul'}>`);
-      }
-      out.push(`<li>${m[2]}</li>`);
-    } else {
-      if (list) { out.push(`</${list.ordered ? 'ol' : 'ul'}>`); list = null; }
-      out.push(line.trim() === '' ? '\u0000P\u0000' : line);
-    }
-  }
-  if (list) out.push(`</${list.ordered ? 'ol' : 'ul'}>`);
-
-  let html = out.join('\n').split(/\u0000P\u0000+/)
-    .map((chunk) => (chunk.trim() ? `<p>${chunk.replace(/\n/g, '<br>')}</p>` : '')).join('');
-
-  html = html.replace(/\u0000TBL(\d+)\u0000/g, (_, i) => tbl[+i]);
-  html = html.replace(/\u0000BLOCK(\d+)\u0000/g, (_, i) => {
-    const b = blocks[+i];
-    const lang = (b.lang || '').toLowerCase();
-    const code = b.code.replace(/\n$/, '');
-    if (lang === 'mermaid') {
-      return `<div class="mermaid-wrap" data-mermaid="${esc(code)}"><pre class="mermaid-src" hidden>${esc(code)}</pre></div>`;
-    }
-    const wrapped = `<pre data-code="${esc(code)}"><code data-lang="${esc(lang)}">${highlight(code, lang)}</code></pre>`;
-    return wrapped;
-  });
-  return html;
-}
-
-
-/* --------------------------- model load banner --------------------------- */
-const jobSample = { t: 0, bytes: 0, rate: 0 };
-let jobDoneUntil = 0;
-let jobErrDismissed = false;
-
-const fmtBytes = (n) => {
-  if (!n) return '';
-  if (n > 1024 ** 3) return (n / 1024 ** 3).toFixed(2) + ' GB';
-  if (n > 1024 ** 2) return (n / 1024 ** 2).toFixed(0) + ' MB';
-  return (n / 1024).toFixed(0) + ' KB';
-};
-const fmtDur = (s) => (s >= 90 ? Math.round(s / 60) + ' min' : Math.round(s) + ' s');
-
-function renderJobBanner() {
-  const j = state.job || {};
-  const el = $('#jobBanner');
-  if (!el) return;
-  const active = JOB_ACTIVE.includes(j.state);
-  const failed = j.state === 'failed';
-  const readyFlash = j.state === 'ready' && Date.now() < jobDoneUntil;
-
-  if (!active && !failed && !readyFlash) { el.hidden = true; return; }
-  if (failed && jobErrDismissed) { el.hidden = true; return; }
-
-  el.hidden = false;
-  el.className = failed ? 'err' : readyFlash ? 'done' : '';
-
-  const now = Date.now();
-  const bytes = j.bytes_done || 0;
-  if (bytes && now - jobSample.t > 600) {
-    if (jobSample.bytes && bytes > jobSample.bytes) {
-      const dt = (now - jobSample.t) / 1000;
-      jobSample.rate = (bytes - jobSample.bytes) / dt;
-    }
-    jobSample.t = now;
-    jobSample.bytes = bytes;
-  }
-  if (!active) { jobSample.t = 0; jobSample.bytes = 0; jobSample.rate = 0; }
-
-  const pct = Math.round(j.progress || 0);
-  const indeterminate = ['starting', 'preparing', 'stopping'].includes(j.state);
-  $('#jbState').textContent = failed ? 'load failed' : readyFlash ? 'ready' : j.state;
-  $('#jbModel').textContent = j.model || '';
-  const fill = $('#jbFill');
-  fill.classList.toggle('indet', indeterminate);
-  fill.style.width = (failed ? 100 : readyFlash ? 100 : indeterminate ? 32 : Math.max(3, pct)) + '%';
-  const elapsed = active && j.started ? (Date.now() / 1000 - j.started) : 0;
-
-  const bits = [];
-  if (active) {
-    if (j.state === 'downloading' && j.bytes_total) {
-      bits.push(`${fmtBytes(bytes)} / ${fmtBytes(j.bytes_total)}`);
-      if (jobSample.rate > 0) bits.push(`${fmtBytes(jobSample.rate)}/s`);
-      const remaining = (j.bytes_total - bytes) / (jobSample.rate || 1);
-      if (jobSample.rate > 0 && remaining > 0) bits.push(`~${fmtDur(remaining)} left`);
-    }
-    if (j.state === 'downloading') { if (pct) bits.push(`${pct}%`); }
-    else if (indeterminate && elapsed > 0) bits.push(`${Math.round(elapsed)}s`);
-    if (j.message && !j.message.startsWith('downloading')) bits.push(j.message);
-  }
-  if (failed) bits.push((j.error || '').split('\n')[0].slice(0, 120));
-  if (readyFlash) bits.push(j.message || 'model is serving');
-  $('#jbNum').textContent = bits.join(' · ');
-
-  $('#jbCancel').hidden = !active;
-  $('#jbLog').hidden = !failed;
-  $('#jbModel').title = j.model || '';
-}
-
-function dismissJobBanner() {
-  jobErrDismissed = true;
-  $('#jobBanner').hidden = true;
 }
 
 /* ------------------------------ chats ------------------------------ */
@@ -523,7 +414,11 @@ async function sendMessage(textOverride) {
         if (ev === 'delta') {
           assistant.content += data.text;
           chars += data.text.length;
-          bodyEl.innerHTML = md(assistant.content) + '<span class="cursor"></span>';
+          const now = performance.now();
+          if (now - (assistant._lastRender || 0) > 120) {
+            assistant._lastRender = now;
+            bodyEl.innerHTML = md(assistant.content) + '<span class="cursor"></span>';
+          }
           const secs = Math.max(0.001, (performance.now() - t0) / 1000);
           $('#streamHint').textContent = `~${Math.round(chars / 4 / secs)} tok/s`;
           $('#messages').scrollTop = $('#messages').scrollHeight;
