@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py ./
 COPY harness2_lite.py ./
+COPY memory.py ./
 COPY static ./static
 COPY mcp_demo_server.py ./
 COPY README.md ./

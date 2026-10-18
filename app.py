@@ -1394,6 +1394,19 @@ def api_server_start(req: ServerStartRequest = Body(...)) -> dict[str, Any]:
     return start_load(payload)
 
 
+@app.get("/api/memory", tags=["system"], summary="Memory picture and a model sizing plan")
+def api_memory(model: str | None = None) -> dict[str, Any]:
+    """Host numbers when a loader agent is configured; otherwise the container's own
+    cgroup view, which is still useful but not what SGLang competes for."""
+    if LOADER_URL:
+        return loader_call("GET", "/memory" + (f"?model={model}" if model else ""))
+    from memory import plan, snapshot
+
+    target = model or server_info().get("model") or load_settings().get("model") or ""
+    return {"scope": "container", "snapshot": snapshot(),
+            "plan": plan(target) if target else None}
+
+
 @app.get("/api/server/job", tags=["server"], summary="Current load/download job")
 def api_server_job() -> dict[str, Any]:
     if LOADER_URL:

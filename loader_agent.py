@@ -21,12 +21,15 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import memory as meminfo  # noqa: E402  (host RAM accounting; local module)
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -299,6 +302,18 @@ def load(payload: dict = Body(...)) -> dict[str, Any]:
                                  "16384 dies with a Metal OOM)")
     threading.Thread(target=worker, args=(payload,), daemon=True).start()
     return {"accepted": True, "model": payload["model"]}
+
+
+@app.get("/memory", tags=["system"], summary="Host memory and a model sizing plan")
+def memory(model: str | None = None) -> dict[str, Any]:
+    """Unified memory is shared by macOS, Docker and SGLang, so the numbers that
+    matter (available RAM, swap, pressure, per-process RSS) only exist on the host."""
+    target = model or (JOB.last_payload or {}).get("model") or JOB.get().get("model") or ""
+    return {
+        "scope": "host",
+        "snapshot": meminfo.snapshot(),
+        "plan": meminfo.plan(target) if target else None,
+    }
 
 
 @app.get("/job", tags=["server"], summary="Current job state")

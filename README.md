@@ -273,6 +273,28 @@ On NVIDIA, raise it freely (`--mem-fraction-static 0.85`).
 
 ---
 
+## Memory
+
+`memory.py` measures the machine and sizes a model so it actually fits. Unified memory is
+shared by macOS, Docker and SGLang, and both failure modes are decided at launch: too high a
+`--mem-fraction-static` aborts the Metal allocator, too low leaves a KV pool of a few hundred
+tokens. The plan is computed from real numbers — weight shards in the HF cache, KV cost per
+token from the model's own `config.json`, and current available RAM:
+
+```
+GET /memory?model=Qwen/Qwen3-1.7B          # loader (host numbers)
+GET /api/memory                            # workbench, proxied to the loader
+```
+
+The loader answers with `scope: "host"` (available RAM, swap, pressure, per-process RSS) plus a
+plan; without a loader the workbench falls back to `scope: "container"`, which is the cgroup view
+and worth knowing but is not what SGLang competes for. Example on this 24 GB M4 Pro:
+
+```
+3.78 GB weights + 10.50 GB KV of 14.88 GB allocated (mem-fraction 0.62)
+pool ≈ 98,304 tokens, ctx 12,288
+```
+
 ## Layout and remembered state
 
 The workspace is a real three-column layout, not a chat page with a drawer:
