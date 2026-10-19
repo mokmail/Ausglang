@@ -11,6 +11,15 @@ on macOS, Windows and Linux while the Metal/CUDA stack stays where it works.
 
 ## Quick start
 
+```bash
+./start-workbench.sh        # Docker + loader + engine + container, then prints the URLs
+```
+
+It resolves the host's LAN address before starting the container: on this VM setup
+`host.docker.internal` resolves to the VM's own loopback and the engine connection is refused,
+so the compose file's hostname default cannot be trusted. Re-run the script after a reboot or a
+DHCP lease change.
+
 ### 1. Start SGLang (the model server)
 
 **macOS (Metal + MLX)**
