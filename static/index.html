@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SGLang Workbench</title>
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/app.css?v=3">
 </head>
 <body>
 <div id="app">
@@ -104,8 +104,8 @@
 
     <section id="messages"><div class="empty" id="emptyState">
       <div class="empty-logo">S</div>
-      <h2>Local inference, properly harnessed</h2>
-      <p>Streaming, memory, MCP tools, model switching, attachments, personas and a context window you control — all served by SGLang on this Mac.</p>
+      <h2>What can I help with?</h2>
+      <p>Ask anything — streaming answers, memory, MCP tools, model switching and attachments, all served locally by SGLang.</p>
       <div class="suggestions" id="suggestions"></div>
     </div></section>
 
@@ -113,7 +113,7 @@
       <div class="composer-inner">
         <div class="composer-box">
           <div id="attachRow" class="attach-row" hidden></div>
-          <textarea id="input" rows="1" placeholder="Message the model…  (⏎ send · ⇧⏎ newline · ⌘K palette)"></textarea>
+          <textarea id="input" rows="1" placeholder="Send a message…"></textarea>
           <div class="composer-tools">
             <button class="mini icon" id="attachBtn" title="Attach a document (PDF, DOCX, PPTX, XLSX, text)">
               <svg viewBox="0 0 24 24"><path d="M21 12.5l-8.5 8.5a5 5 0 0 1-7-7l8.5-8.5a3.5 3.5 0 0 1 5 5L10 19"/></svg>
@@ -253,11 +253,62 @@
 
       <div class="tab-pane" data-pane="harness">
         <p class="muted">Eight editable components around the model (system prompt, guardrails, memory, tool guidance, subagents, skills, scripts, plugins). The active harness is bound per chat.</p>
+
+        <div class="recursion-card compose-card" id="composeCard">
+          <div class="rc-head">
+            <div class="rc-title">
+              <span class="rc-orb"></span>
+              <b>Composition</b>
+              <span class="rc-sub" id="composeSub">profile · bundles · plugins</span>
+            </div>
+            <span class="badge" id="composeState">—</span>
+          </div>
+          <div class="rc-chips" id="composeRows"></div>
+          <div class="row">
+            <button class="mini" id="composeRefresh">refresh</button>
+            <button class="mini" id="compactNow" title="Condense this chat's session now">condense chat</button>
+          </div>
+          <pre class="log" id="composeLog" hidden></pre>
+        </div>
         <div class="row">
           <select id="harnessSelect"></select>
           <button class="btn ghost" id="harnessNew" title="New harness">New</button>
           <button class="btn ghost" id="harnessDup" title="Duplicate">Dup</button>
           <button class="btn ghost" id="harnessDel" title="Delete">Del</button>
+        </div>
+
+        <div class="recursion-card" id="recursionCard">
+          <div class="rc-head">
+            <div class="rc-title">
+              <span class="rc-orb"></span>
+              <b>Recursive refinement</b>
+              <span class="rc-sub">Propose → probe → compose on this task</span>
+            </div>
+            <span class="badge" id="rcState">idle</span>
+          </div>
+          <input id="rcTask" placeholder="Task — defaults to the last user turn">
+          <div class="row rc-controls">
+            <select id="rcMode" title="Sequential refines deeply; parallel explores wider">
+              <option value="sequential">sequential</option>
+              <option value="parallel">parallel</option>
+            </select>
+            <label class="rc-k" title="Task-level recursion budget"><span>k</span>
+              <input id="rcK" type="number" min="1" max="3" value="1">
+            </label>
+            <button class="btn primary" id="rcRun">Refine harness</button>
+            <button class="btn ghost" id="rcCancel" hidden>Cancel</button>
+          </div>
+          <div class="progress" id="rcProgress" hidden><div class="bar" id="rcBar"></div></div>
+          <div class="rc-log" id="rcLog">Run one Propose–Probe–Compose step to adapt this harness to the current task.</div>
+          <div id="rcResult" hidden>
+            <div class="rc-verdict" id="rcVerdict"></div>
+            <div class="rc-chips" id="rcChips"></div>
+            <pre class="log" id="rcPreview"></pre>
+            <div class="row">
+              <button class="btn primary" id="rcAdopt">Save as new harness</button>
+              <button class="btn ghost" id="rcAdoptBind">Save + bind</button>
+            </div>
+          </div>
         </div>
         <label class="field"><span>System prompt</span><textarea id="hSystem" rows="4"></textarea></label>
         <label class="field"><span>Guardrails</span><textarea id="hGuard" rows="3"></textarea></label>
@@ -355,6 +406,6 @@
 <script src="/static/vendor/purify.min.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/mermaid.min.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=3"></script>
 </body>
 </html>

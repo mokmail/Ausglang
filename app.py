@@ -13,7 +13,8 @@ Capabilities
              /get_server_info introspection, RSS, log tail
   memory     long-term facts ranked against each message and injected
   mcp        stdio JSON-RPC servers, tool discovery, manual + harness tool calls
-  harness    model-driven tool loop with a JSON protocol any local model can follow
+  harness    model-driven tool loop with a JSON protocol any local model can follow,
+             plus recursive Propose–Probe–Compose harness refinement
   prompts    reusable prompt library
   personas   saved system-prompt + sampling profiles
   settings   temperature/top_p/top_k/max_tokens/repeat penalty/seed/stop/json mode
@@ -40,6 +41,8 @@ from typing import Any
 
 import httpx
 import harness2_lite as h2
+from dsh import runtime as dsh_runtime
+from dsh.llm import OpenAICompatibleAdapter
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -55,6 +58,9 @@ DB_PATH = DATA / "workbench.db"
 SETTINGS_PATH = DATA / "settings.json"
 MCP_PATH = DATA / "mcp_servers.json"
 MODEL_CACHE = DATA / "models_cache.json"
+DSH_SESSIONS = DATA / "sessions"
+LEGACY_LOOP = os.environ.get("WORKBENCH_LEGACY_LOOP", "").strip().lower() in (
+    "1", "true", "yes", "on")
 SERVER_LOG = Path(os.environ.get("SGLANG_LOG", str(ROOT / "server.log")))
 
 UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:43440").rstrip("/")
@@ -174,6 +180,12 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS lessons (
                 id TEXT PRIMARY KEY, domain TEXT, cue TEXT, lesson TEXT,
                 evidence TEXT, confidence TEXT, created REAL
+            );
+            CREATE TABLE IF NOT EXISTS harness_runs (
+                id TEXT PRIMARY KEY, harness_id TEXT, chat_id TEXT, task TEXT,
+                mode TEXT, k INTEGER, state TEXT, step INTEGER, progress REAL,
+                baseline TEXT, candidates TEXT, verdict TEXT, result TEXT,
+                error TEXT, created REAL, finished REAL
             );
             """
         )
@@ -623,6 +635,166 @@ def server_info(ttl: float = 2.0) -> dict[str, Any]:
             base["rss_gb"] = round(int(rss) / 2**20, 2)
     _INFO_CACHE.update(t=time.time(), v=dict(base))
     return base
+
+
+# ---- engine provisioning --------------------------------------------------- #
+# The engine may run outside this container (compose `gpu` profile, host loader,
+# another box). There is no local job to poll then, so this synthesizes one from
+# what is observable here: the upstream health check, partial blobs in the
+# read-only HF cache, and an optional status file written by start-gpu.sh.
+
+ENGINE_MODEL = os.environ.get("WORKBENCH_ENGINE_MODEL", "").strip()
+ENGINE_STATUS_PATH = DATA / "engine-status.json"
+_ENGINE_DOWN_SINCE: float | None = None
+_HF_TOTAL: dict[str, tuple[float, int | None]] = {}
+_HF_RATE: dict[str, tuple[float, int, float | None]] = {}
+
+
+def _engine_file_status() -> dict[str, Any] | None:
+    """Fresh status written by the host launcher (start-gpu.sh), if any."""
+    try:
+        raw = json.loads(ENGINE_STATUS_PATH.read_text())
+    except Exception:
+        return None
+    try:
+        updated = float(raw.get("updated") or 0)
+    except (TypeError, ValueError):
+        return None
+    if time.time() - updated > 900:      # stale: no launcher is running
+        return None
+    raw["age_s"] = round(time.time() - updated, 1)
+    return raw
+
+
+def _hf_cache_bytes(model: str) -> dict[str, int] | None:
+    """Bytes already in the HF cache for `model`, including `.incomplete` blobs."""
+    base = HF_CACHE_DIR / "hub" / ("models--" + model.replace("/", "--")) / "blobs"
+    if not base.is_dir():
+        return None
+    done = partial = files = 0
+    newest = 0.0
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return None
+    for p in entries:
+        try:
+            if not p.is_file():
+                continue
+            st = p.stat()
+        except OSError:
+            continue
+        files += 1
+        done += st.st_size
+        if p.name.endswith(".incomplete"):
+            partial += st.st_size
+            newest = max(newest, st.st_mtime)
+    return {"done": done, "partial": partial, "files": files, "newest": newest}
+
+
+def _hf_repo_total(model: str) -> int | None:
+    """Sum of the repo's file sizes, so a partial download gets a real percent."""
+    hit = _HF_TOTAL.get(model)
+    if hit and time.time() - hit[0] < (600 if hit[1] else 60):
+        return hit[1]
+    total: int | None = None
+    try:
+        r = httpx.get(f"https://huggingface.co/api/models/{model}",
+                      params={"blobs": "true"}, timeout=4.0)
+        if r.status_code == 200:
+            sizes = [int(s.get("size") or 0) for s in r.json().get("siblings") or []]
+            if sum(sizes) > 0:
+                total = sum(sizes)
+    except Exception:
+        pass
+    _HF_TOTAL[model] = (time.time(), total)
+    return total
+
+
+def _hf_rate(model: str, done: int) -> float | None:
+    """Bytes/second over the last sample, smoothed across polls."""
+    now = time.time()
+    prev = _HF_RATE.get(model)
+    rate: float | None = None
+    if prev and now - prev[0] >= 1.5:
+        rate = (done - prev[1]) / (now - prev[0]) if done >= prev[1] else None
+    elif prev:
+        rate = prev[2]
+    _HF_RATE[model] = (now, done, rate)
+    return rate
+
+
+def engine_status() -> dict[str, Any]:
+    """One object the UI can render while the engine is being provisioned.
+
+    Phases: ready → pulling → downloading → starting → waiting (and failed).
+    `progress` is a real percentage only while downloading or when the host
+    launcher reports one; the UI shows an indeterminate sweep otherwise.
+    """
+    global _ENGINE_DOWN_SINCE
+    info = server_info()
+    up = bool(info.get("up"))
+    now = time.time()
+    model = (ENGINE_MODEL or info.get("model") or load_settings().get("model") or "").strip()
+    base: dict[str, Any] = {
+        "url": UPSTREAM,
+        "model": model or None,
+        "reachable": up,
+    }
+    if up:
+        _ENGINE_DOWN_SINCE = None
+        _HF_RATE.pop(model, None)
+        return {**base, "phase": "ready", "active": False, "progress": 100,
+                "message": "engine ready", "elapsed_s": None, "hint": None}
+
+    if _ENGINE_DOWN_SINCE is None:
+        _ENGINE_DOWN_SINCE = now
+    elapsed = round(now - _ENGINE_DOWN_SINCE, 1)
+    cached = _hf_cache_bytes(model) if model else None
+    launcher = _engine_file_status()
+
+    # A partial blob is the most useful signal: real bytes and a real percent.
+    # Ignore partials that stopped changing long ago (an aborted download).
+    stale_partial = cached and cached["partial"] > 0 and \
+        not launcher and now - cached["newest"] > 900
+    if cached and cached["partial"] > 0 and not stale_partial:
+        total = _hf_repo_total(model)
+        pct = min(100.0, 100.0 * cached["done"] / total) if total else None
+        return {**base, "phase": "downloading", "active": True, "progress": pct,
+                "bytes_done": cached["done"], "bytes_total": total,
+                "rate_bps": _hf_rate(model, cached["done"]),
+                "message": f"downloading {model}", "elapsed_s": elapsed,
+                "hint": "the model weights are being written to the HF cache"}
+
+    if launcher and launcher.get("phase") in ("pulling", "starting", "failed"):
+        phase = str(launcher["phase"])
+        return {**base, "phase": phase, "active": phase != "failed",
+                "progress": launcher.get("progress"),
+                "message": launcher.get("message") or {
+                    "pulling": "pulling engine image",
+                    "starting": "starting the engine",
+                }.get(phase, phase),
+                "elapsed_s": elapsed, "hint": launcher.get("hint")}
+
+    if cached and cached["files"]:
+        return {**base, "phase": "starting", "active": True, "progress": None,
+                "bytes_done": cached["done"],
+                "message": "weights cached — warming up the engine",
+                "elapsed_s": elapsed,
+                "hint": "SGLang is loading the weights onto the GPU"}
+
+    # An engine that is merely switched off is not a pull in progress. Keep the
+    # banner for the first 15 minutes (the normal provisioning window), then fall
+    # back to the status pill so it does not nag forever.
+    if elapsed > 900:
+        return {**base, "phase": "offline", "active": False, "progress": None,
+                "message": "engine offline", "elapsed_s": elapsed,
+                "hint": "start it with ./start-gpu.sh or point UPSTREAM at a running server"}
+
+    return {**base, "phase": "waiting", "active": True, "progress": None,
+            "message": "waiting for the engine", "elapsed_s": elapsed,
+            "hint": ("the first start pulls the Docker image and model; "
+                     "this can take several minutes")}
 
 
 def _download(model: str) -> None:
@@ -1210,7 +1382,7 @@ def list_harnesses() -> list[dict[str, Any]]:
     out = []
     for r in rows:
         comps = h2.normalize(json.loads(r["components"] or "{}"))
-        out.append({"id": r["id"], "name": r["name"], **comps,
+        out.append({**comps, "id": r["id"], "name": r["name"],
                     "created": r["created"], "updated": r["updated"]})
     return out
 
@@ -1228,7 +1400,7 @@ def get_harness(harness_id: str | None, chat_id: str | None = None) -> dict[str,
     if not row:
         return {"id": None, **h2.normalize(None)}
     comps = h2.normalize(json.loads(row["components"] or "{}"))
-    return {"id": row["id"], "name": row["name"], **comps}
+    return {**comps, "id": row["id"], "name": row["name"]}
 
 
 def save_harness(harness_id: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -1237,13 +1409,518 @@ def save_harness(harness_id: str, patch: dict[str, Any]) -> dict[str, Any]:
     with db() as conn:
         conn.execute("UPDATE harnesses SET name=?, components=?, updated=? WHERE id=?",
                      (merged.get("name") or "Harness", json.dumps(merged), h2.now(), harness_id))
-    return {"id": harness_id, **merged}
+    return {**merged, "id": harness_id}
 
 
 def lessons_for(query: str) -> list[dict[str, Any]]:
     with db() as conn:
         rows = conn.execute("SELECT * FROM lessons ORDER BY created DESC LIMIT 200").fetchall()
     return h2.lesson_context([dict(r) for r in rows], query)
+
+
+# ---- recursive refinement: Propose–Probe–Compose --------------------------- #
+
+
+class HarnessRunJob:
+    """Small background job so the recursion survives a slow local model."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.cancel = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.state: dict[str, Any] = {
+            "state": "idle", "run_id": None, "harness_id": None, "mode": None, "k": 0,
+            "step": 0, "progress": 0.0, "message": "", "error": None,
+            "started": None, "finished": None, "result": None,
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return dict(self.state)
+
+    def _set(self, **kw: Any) -> None:
+        with self.lock:
+            self.state.update(kw)
+
+
+H2_JOB = HarnessRunJob()
+H2_ACTIVE = ("proposing", "probing", "judging", "composing", "reflecting")
+
+
+class H2Cancelled(Exception):
+    pass
+
+
+def _h2_check_cancel() -> None:
+    if H2_JOB.cancel.is_set():
+        raise H2Cancelled()
+
+
+def _h2_row_update(run_id: str, **fields: Any) -> None:
+    allowed = {"state", "step", "progress", "baseline", "candidates", "verdict",
+               "result", "error", "finished"}
+    clean = {k: v for k, v in fields.items() if k in allowed}
+    if not clean:
+        return
+    for k, v in list(clean.items()):
+        if isinstance(v, (dict, list)):
+            clean[k] = json.dumps(v, ensure_ascii=False)
+    cols = ", ".join(f"{k}=?" for k in clean)
+    with db() as conn:
+        conn.execute(f"UPDATE harness_runs SET {cols} WHERE id=?", (*clean.values(), run_id))
+
+
+def _h2_job(state: str, *, step: int = 0, progress: float = 0.0,
+            message: str = "", error: str | None = None,
+            result: dict[str, Any] | None = None) -> None:
+    H2_JOB._set(state=state, step=step, progress=round(progress, 1),
+                message=message, error=error, result=result)
+
+
+async def _h2_complete(messages: list[dict[str, str]], *,
+                       max_tokens: int = 500, temperature: float = 0.25) -> str:
+    """One tool-free completion used by the harness editor/judge/composer."""
+    settings = load_settings()
+    body = {
+        "model": settings.get("model"),
+        "messages": messages,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "top_p": 0.95,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(f"{resolve_upstream()}/v1/chat/completions", json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"upstream {r.status_code}: {r.text[:400]}")
+    data = r.json()
+    return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+
+
+async def _h2_probe(harness: dict[str, Any], task: str, params: dict[str, Any],
+                    cid: str, name: str) -> dict[str, Any]:
+    """Run the same task under one harness, with no tools (isolate the harness)."""
+    mem = memory_context(task) if params.get("memory_enabled") else ""
+    lessons = lessons_for(task) if params.get("memory_enabled") else []
+    system, report = h2.compose_system(
+        harness, lessons=lessons, memory_text=mem,
+        json_mode=bool(params.get("json_mode")),
+    )
+    messages = ([{"role": "system", "content": system}] if system.strip() else [])
+    messages.append({"role": "user", "content": task})
+    started = time.time()
+    text = await _h2_complete(messages, max_tokens=int(params.get("probe_tokens") or 420),
+                              temperature=0.35)
+    return {
+        "id": cid,
+        "name": name,
+        "harness": harness,
+        "text": text,
+        "elapsed_s": round(time.time() - started, 2),
+        "report": report,
+        "guardrails": h2.check_output(harness, text),
+    }
+
+
+async def _h2_propose(harness: dict[str, Any], task: str, *,
+                      angle: str, step: int, budget: int,
+                      lessons: list[dict[str, Any]]) -> dict[str, Any]:
+    raw = await _h2_complete(
+        h2.proposal_messages(harness, task, lessons=lessons, angle=angle,
+                             step=step, budget=budget),
+        max_tokens=520, temperature=0.45,
+    )
+    parsed = h2.parse_json(raw)
+    edits = h2.edits_from_payload(parsed)
+    candidate, applied, skipped = h2.apply_edits(harness, edits, report=True)
+    rationale = (parsed.get("rationale") if isinstance(parsed, dict) else "") or ""
+    if not applied:
+        edits = h2.heuristic_edits(task)
+        candidate, applied, skipped = h2.apply_edits(harness, edits, report=True)
+        rationale = (rationale + " · " if rationale else "") + \
+            "model proposal was unusable; applied a deterministic task-focus edit"
+    return {"angle": angle, "raw": raw, "rationale": rationale,
+            "edits": edits, "applied": applied, "skipped": skipped,
+            "harness": candidate}
+
+
+def _h2_score_values(score: dict[str, Any]) -> float:
+    def num(key: str) -> float:
+        try:
+            return max(0.0, min(10.0, float(score.get(key) or 0)))
+        except (TypeError, ValueError):
+            return 0.0
+    # New schema is one score; the older three-axis schema still works.
+    if score.get("score") is not None:
+        return round(num("score"), 2)
+    if score.get("total") is not None:
+        return round(num("total"), 2)
+    return round(num("fit") * 0.5 + num("actionability") * 0.3 + num("safety") * 0.2, 2)
+
+
+def _h2_attach_scores(candidates: list[dict[str, Any]],
+                      verdict: dict[str, Any]) -> str | None:
+    scores = verdict.get("scores") if isinstance(verdict.get("scores"), list) else []
+    best: tuple[float, str] | None = None
+    for c in candidates:
+        found = next((s for s in scores if str(s.get("id")) == str(c.get("id"))), {})
+        c["score"] = _h2_score_values(found)
+        c["note"] = str(found.get("note") or "")
+        if best is None or c["score"] > best[0]:
+            best = (c["score"], str(c.get("id")))
+    winner = str(verdict.get("winner") or "")
+    if winner.lower() in ("baseline", "base", "none"):
+        verdict["winner"] = "baseline"
+        return None
+    if not any(winner == str(c.get("id")) for c in candidates):
+        winner = best[1] if best else ""
+    verdict["winner"] = winner
+    return winner or None
+
+
+async def _h2_judge(task: str, baseline: dict[str, Any],
+                    candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    raw = await _h2_complete(h2.judge_messages(task, baseline, candidates),
+                             max_tokens=450, temperature=0.15)
+    parsed = h2.parse_json(raw)
+    if isinstance(parsed, list):
+        parsed = {"scores": parsed}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    raw_scores = parsed.get("scores")
+    rows: list[dict[str, Any]] = []
+    if isinstance(raw_scores, dict):
+        for cid, val in raw_scores.items():
+            if isinstance(val, dict):
+                rows.append({"id": str(cid), **val})
+            elif isinstance(val, (int, float)):
+                rows.append({"id": str(cid), "score": val})
+    elif isinstance(raw_scores, list):
+        for s in raw_scores:
+            if not isinstance(s, dict):
+                continue
+            cid = s.get("id") or s.get("candidate") or s.get("name")
+            if cid is None:
+                continue
+            rows.append({
+                "id": str(cid),
+                "score": s.get("score", s.get("total")),
+                "fit": s.get("fit"),
+                "actionability": s.get("actionability"),
+                "safety": s.get("safety"),
+                "note": s.get("note") or s.get("rationale") or s.get("reason") or "",
+            })
+    # Some models return {"c1": 8, "c2": 6} at the top level.
+    if not rows:
+        for c in candidates:
+            val = parsed.get(str(c.get("id")))
+            if isinstance(val, (int, float)):
+                rows.append({"id": str(c.get("id")), "score": val})
+    known = {str(c.get("id")) for c in candidates} | {"baseline"}
+    # Local models often copy the example id ("c1"). If none of the ids match,
+    # preserve the judge's ordering and assign scores to the real candidates.
+    if rows and not any(str(r.get("id")) in known for r in rows):
+        for i, r in enumerate(rows):
+            if i < len(candidates):
+                r["id"] = str(candidates[i].get("id"))
+    rows = [r for r in rows if str(r.get("id")) in known]
+    deduped: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for r in rows:
+        rid = str(r.get("id"))
+        if rid in seen_ids:
+            continue
+        seen_ids.add(rid)
+        deduped.append(r)
+    rows = deduped
+    if not rows:
+        rows = [{"id": str(c.get("id")), "score": 6,
+                 "note": "judge produced no parseable scores"} for c in candidates]
+    for c in candidates:
+        if not any(str(r.get("id")) == str(c.get("id")) for r in rows):
+            rows.append({"id": str(c.get("id")), "score": 5,
+                         "note": "not scored by the judge"})
+
+    winner = str(parsed.get("winner") or parsed.get("best") or "").strip()
+    normalized = {
+        "scores": rows,
+        "winner": winner,
+        "rationale": str(parsed.get("rationale") or parsed.get("reason") or
+                         "judge compared the probes without ground truth")[:800],
+        "raw": raw,
+    }
+    return normalized
+
+
+async def _h2_compose(base: dict[str, Any], task: str, baseline: dict[str, Any],
+                      candidates: list[dict[str, Any]], verdict: dict[str, Any]) -> dict[str, Any]:
+    if str(verdict.get("winner") or "").lower() in ("baseline", "base"):
+        return {"harness": base, "edits": [], "applied": 0,
+                "rationale": "baseline judged best; no edit is justified", "raw": ""}
+    raw = await _h2_complete(
+        h2.compose_messages(base, task, baseline, candidates, verdict),
+        max_tokens=650, temperature=0.3,
+    )
+    parsed = h2.parse_json(raw)
+    edits = h2.edits_from_payload(parsed)
+    if edits:
+        candidate, applied, _ = h2.apply_edits(base, edits, report=True)
+        if applied:
+            return {"harness": candidate, "edits": edits, "applied": applied,
+                    "rationale": (parsed.get("rationale") if isinstance(parsed, dict) else "") or "",
+                    "raw": raw}
+    # No composed edits: fall back to the judged winner, not to the baseline.
+    winner = str(verdict.get("winner") or "")
+    chosen = next((c for c in candidates if str(c.get("id")) == winner), None)
+    fallback = (chosen or {}).get("harness") or base
+    fallback_edits = (chosen or {}).get("edits") or []
+    if json.dumps(h2.normalize(fallback), sort_keys=True) == json.dumps(h2.normalize(base), sort_keys=True):
+        fallback_edits = h2.heuristic_edits(task)
+        fallback, applied, _ = h2.apply_edits(base, fallback_edits, report=True)
+        if not applied:
+            fallback_edits = []
+    return {"harness": fallback, "edits": fallback_edits,
+            "applied": len(fallback_edits),
+            "rationale": "composer returned no valid edits; kept the strongest usable probe",
+            "raw": raw}
+
+
+async def _h2_reflect(task: str, before: dict[str, Any], after: dict[str, Any],
+                      evidence: str, domain: str, *, changed: bool = True) -> dict[str, Any]:
+    if not changed:
+        lesson = {
+            "cue": "tasks where the baseline already performs well",
+            "lesson": ("Keep the harness unchanged unless a probe shows a concrete gain; "
+                       "do not add task-focus boilerplate."),
+            "evidence": "no candidate exceeded the baseline on this task",
+            "confidence": "medium",
+        }
+        lid = h2.new_id()
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO lessons (id,domain,cue,lesson,evidence,confidence,created) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (lid, domain, lesson["cue"], lesson["lesson"], lesson["evidence"],
+                 lesson["confidence"], h2.now()),
+            )
+        lesson["id"] = lid
+        return lesson
+    raw = await _h2_complete(h2.reflect_messages(task, before, after, evidence),
+                             max_tokens=240, temperature=0.2)
+    parsed = h2.parse_json(raw)
+    if not isinstance(parsed, dict):
+        parsed = {}
+    lesson_text = str(parsed.get("lesson") or "").strip()
+    useful = bool(re.search(
+        r"(?i)\b(task|deliverable|check|verify|restate|state|format|plan|assumption|output|step|brief)\b",
+        lesson_text,
+    ))
+    if len(lesson_text) < 20 or not useful:
+        lesson_text = ("Add a task-focus block that names the deliverable and the check "
+                       "that proves it before answering.")
+        parsed = {"cue": "tasks with a concrete deliverable",
+                  "lesson": lesson_text,
+                  "evidence": evidence[:400],
+                  "confidence": "medium"}
+    lesson = {
+        "cue": str(parsed.get("cue") or "")[:300],
+        "lesson": lesson_text[:500],
+        "evidence": str(parsed.get("evidence") or evidence[:400])[:800],
+        "confidence": str(parsed.get("confidence") or "medium")[:16],
+    }
+    if lesson["lesson"]:
+        lid = h2.new_id()
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO lessons (id,domain,cue,lesson,evidence,confidence,created) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (lid, domain, lesson["cue"], lesson["lesson"], lesson["evidence"],
+                 lesson["confidence"], h2.now()),
+            )
+        lesson["id"] = lid
+    return lesson
+
+
+async def _h2_loop(run_id: str, payload: dict[str, Any]) -> None:
+    task = str(payload["task"])
+    mode = str(payload.get("mode") or "sequential")
+    budget = int(payload.get("k") or 1)
+    params = {**load_settings(), **(payload.get("params") or {})}
+    params["tools_enabled"] = False          # isolate the harness, not MCP state
+    initial = payload["harness"]
+    base = initial
+    lessons = lessons_for(task) if params.get("memory_enabled") else []
+    domain = str(payload.get("domain") or "general")
+
+    _h2_job("probing", step=0, progress=8, message="running the baseline")
+    _h2_row_update(run_id, state="probing", step=0, progress=8)
+    baseline = await _h2_probe(base, task, params, "baseline", "baseline")
+    baseline0 = baseline
+    _h2_check_cancel()
+    _h2_job("probing", step=0, progress=20, message="baseline captured")
+    _h2_row_update(run_id, baseline=baseline)
+
+    all_candidates: list[dict[str, Any]] = []
+    steps: list[dict[str, Any]] = []
+    verdict: dict[str, Any] = {}
+
+    if mode == "parallel":
+        angles = ["general"] * budget + ["domain"] * budget
+        _h2_job("proposing", step=0, progress=26,
+                message=f"proposing {len(angles)} harness candidates")
+        proposals = []
+        for i, angle in enumerate(angles):
+            _h2_check_cancel()
+            try:
+                proposals.append(await _h2_propose(base, task, angle=angle, step=1,
+                                                   budget=budget, lessons=lessons))
+            except H2Cancelled:
+                raise
+            except Exception as e:
+                proposals.append({"angle": angle, "edits": h2.heuristic_edits(task),
+                                  "harness": h2.apply_edits(base, h2.heuristic_edits(task)),
+                                  "rationale": f"proposal fallback: {e}"})
+            _h2_job("proposing", step=i + 1, progress=26 + 8 * (i + 1) / len(angles),
+                    message=f"candidate {i + 1}/{len(angles)}")
+        _h2_job("probing", step=0, progress=44, message="probing candidates")
+        # A deterministic task-focus candidate is always included: it keeps the
+        # loop effective when a small model proposes prose instead of an edit.
+        hedits = h2.heuristic_edits(task)
+        hharness = h2.apply_edits(base, hedits)
+        if not any(json.dumps(h2.normalize(p["harness"]), sort_keys=True) ==
+                   json.dumps(h2.normalize(hharness), sort_keys=True) for p in proposals):
+            proposals.append({"angle": "deterministic", "edits": hedits,
+                              "harness": hharness,
+                              "rationale": "task-focus fallback candidate"})
+        for i, prop in enumerate(proposals):
+            _h2_check_cancel()
+            cid = f"c{i + 1}"
+            probe = await _h2_probe(prop["harness"], task, params, cid,
+                                    f"{prop.get('angle')} · {prop.get('rationale', '')[:40]}")
+            probe["angle"] = prop.get("angle")
+            probe["edits"] = prop.get("edits")
+            all_candidates.append(probe)
+            _h2_job("probing", step=i + 1, progress=44 + 14 * (i + 1) / len(proposals),
+                    message=f"probe {i + 1}/{len(proposals)}")
+        _h2_check_cancel()
+        _h2_job("judging", step=0, progress=63, message="contrasting probes")
+        verdict = await _h2_judge(task, baseline, all_candidates)
+        winner = _h2_attach_scores(all_candidates, verdict)
+        _h2_row_update(run_id, candidates=all_candidates, verdict=verdict)
+        _h2_check_cancel()
+        _h2_job("composing", step=0, progress=78, message="composing the refined harness")
+        composed = await _h2_compose(base, task, baseline, all_candidates, verdict)
+        final = composed["harness"]
+        steps.append({"step": 1, "mode": "parallel", "candidates": [
+            c["id"] for c in all_candidates], "winner": winner,
+            "edits": composed.get("edits") or [],
+            "rationale": composed.get("rationale") or ""})
+    else:
+        for step in range(1, budget + 1):
+            _h2_check_cancel()
+            angle = "domain" if step % 2 == 0 else "general"
+            _h2_job("proposing", step=step,
+                    progress=26 + 40 * (step - 1) / max(1, budget),
+                    message=f"step {step}/{budget}: proposing edits")
+            prop = await _h2_propose(base, task, angle=angle, step=step,
+                                     budget=budget, lessons=lessons)
+            _h2_check_cancel()
+            _h2_job("probing", step=step,
+                    progress=36 + 40 * (step - 1) / max(1, budget),
+                    message=f"step {step}/{budget}: probing candidates")
+            step_probes: list[dict[str, Any]] = []
+            cid = f"s{step}"
+            probe = await _h2_probe(prop["harness"], task, params, cid,
+                                    f"{angle} · step {step}")
+            probe["angle"] = angle
+            probe["edits"] = prop.get("edits")
+            step_probes.append(probe)
+            hedits = h2.heuristic_edits(task)
+            hharness = h2.apply_edits(base, hedits)
+            if json.dumps(h2.normalize(hharness), sort_keys=True) != \
+                    json.dumps(h2.normalize(prop["harness"]), sort_keys=True):
+                _h2_job("probing", step=step,
+                        progress=40 + 40 * (step - 1) / max(1, budget),
+                        message=f"step {step}/{budget}: probing deterministic fallback")
+                hprobe = await _h2_probe(hharness, task, params, f"s{step}h",
+                                         "deterministic task focus")
+                hprobe["angle"] = "deterministic"
+                hprobe["edits"] = hedits
+                step_probes.append(hprobe)
+            all_candidates.extend(step_probes)
+            _h2_job("judging", step=step,
+                    progress=46 + 40 * (step - 1) / max(1, budget),
+                    message=f"step {step}/{budget}: contrasting behaviours")
+            verdict = await _h2_judge(task, baseline, step_probes)
+            winner = _h2_attach_scores(step_probes, verdict)
+            _h2_check_cancel()
+            _h2_job("composing", step=step,
+                    progress=58 + 40 * (step - 1) / max(1, budget),
+                    message=f"step {step}/{budget}: composing")
+            composed = await _h2_compose(base, task, baseline, step_probes, verdict)
+            chosen = next((p for p in step_probes if p["id"] == winner), baseline if not winner else step_probes[0])
+            steps.append({"step": step, "angle": angle,
+                          "candidates": [p["id"] for p in step_probes],
+                          "winner": winner, "score": chosen.get("score"),
+                          "edits": composed.get("edits") or [],
+                          "rationale": composed.get("rationale") or "",
+                          "proposal": prop.get("rationale") or ""})
+            base = composed["harness"]
+            baseline = chosen             # next step compares against this behaviour
+            _h2_row_update(run_id, step=step, progress=58 + 40 * step / max(1, budget),
+                           candidates=all_candidates, verdict=verdict)
+        final = base
+
+    _h2_check_cancel()
+    changed = json.dumps(h2.normalize(final), sort_keys=True) != \
+        json.dumps(h2.normalize(initial), sort_keys=True)
+    _h2_job("reflecting", step=budget, progress=93,
+            message="extracting a transferable lesson")
+    evidence = "\n\n".join(
+        f"{c['id']}: {c.get('text', '')[:600]}" for c in all_candidates
+    )
+    lesson = await _h2_reflect(task, initial, final, evidence, domain, changed=changed)
+    _h2_check_cancel()
+
+    system_preview, report = h2.compose_system(final, lessons=lessons,
+                                               memory_text=memory_context(task),
+                                               json_mode=bool(params.get("json_mode")))
+    result = {
+        "harness": final,
+        "base_harness": initial,
+        "baseline": baseline0,
+        "candidates": all_candidates,
+        "verdict": verdict,
+        "steps": steps,
+        "lesson": lesson,
+        "mode": mode,
+        "k": budget,
+        "task": task,
+        "changed": changed,
+        "system_preview": system_preview,
+        "report": report,
+    }
+    _h2_row_update(run_id, state="ready", step=budget, progress=100,
+                   baseline=baseline0, candidates=all_candidates, verdict=verdict,
+                   result=result, finished=h2.now())
+    _h2_job("ready", step=budget, progress=100, message="refined harness ready",
+            result=result)
+    H2_JOB._set(finished=time.time())
+
+
+def _h2_worker(run_id: str, payload: dict[str, Any]) -> None:
+    try:
+        asyncio.run(_h2_loop(run_id, payload))
+    except H2Cancelled:
+        H2_JOB._set(state="cancelled", message="cancelled", finished=time.time())
+        _h2_row_update(run_id, state="cancelled", finished=h2.now())
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        H2_JOB._set(state="failed", error=msg[:2000], message="refinement failed",
+                    finished=time.time())
+        _h2_row_update(run_id, state="failed", error=msg[:2000], finished=h2.now())
 
 
 def effective_tools(harness: dict[str, Any], params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1363,6 +2040,72 @@ def h2_tool_protocol() -> str:
     return TOOL_PROTOCOL
 
 
+# --------------------------------------------------------------------------- #
+# DeepSeek Harness composition — everything below `/api/chat` is a plugin tree
+# --------------------------------------------------------------------------- #
+
+
+def dsh_session_root() -> Path:
+    DSH_SESSIONS.mkdir(parents=True, exist_ok=True)
+    return DSH_SESSIONS
+
+
+def dsh_rows_for(chat_id: str, harness: dict[str, Any], params: dict[str, Any],
+                 query: str, holder: dict[str, Any]) -> list[dict[str, Any]]:
+    """Patch a workbench harness onto the `workbench` profile."""
+    rules = harness.get("rules") or {}
+    memory_on = bool(params.get("memory_enabled"))
+    lessons = lessons_for(query) if (memory_on and rules.get("include_lessons", True)) else []
+    mcp = tool_schemas() if params.get("tools_enabled") else []
+
+    async def call_tool(server: str, tool: str, args: dict[str, Any]) -> str:
+        return await run_tool(server, tool, args)
+
+    def artifact_write(name: str, content: str) -> dict[str, Any]:
+        _, art = run_artifact_tool(chat_id, "write_file", {"name": name, "content": content})
+        return {"name": name, "artifact": art}
+
+    def artifact_read(name: str) -> str:
+        return run_artifact_tool(chat_id, "read_file", {"name": name})[0]
+
+    def artifact_list() -> list[dict[str, Any]]:
+        return [{"name": a["name"], "size": a.get("size")} for a in artifact_rows(chat_id)]
+
+    async def subagent_runner(**kw: Any) -> str:
+        host = holder.get("host")
+        if host is None:
+            return "error: the composition is not mounted"
+        return await dsh_runtime.run_subagent(host, params=params, **kw)
+
+    return dsh_runtime.build_rows(
+        harness, params,
+        chat_id=chat_id,
+        session_root=dsh_session_root(),
+        memory_text=memory_context(query) if memory_on else "",
+        lessons=lessons,
+        tool_schemas=mcp,
+        tool_call=call_tool,
+        artifact_write=artifact_write,
+        artifact_read=artifact_read,
+        artifact_list=artifact_list,
+        subagent_runner=subagent_runner,
+        model=params.get("model") or "",
+        provider="sglang",
+        workspace=str(DATA),
+    )
+
+
+def dsh_mount(rows: list[dict[str, Any]], holder: dict[str, Any]) -> Any:
+    adapter = OpenAICompatibleAdapter(
+        UPSTREAM,
+        api_key=os.environ.get("WORKBENCH_UPSTREAM_KEY", ""),
+        timeout=(10.0, 600.0),
+    )
+    host = dsh_runtime.build_host(rows, adapter=adapter)
+    holder["host"] = host
+    return host
+
+
 @app.get("/api/state", tags=["system"], summary="Full runtime snapshot")
 def api_state() -> dict[str, Any]:
     s = load_settings()
@@ -1377,6 +2120,7 @@ def api_state() -> dict[str, Any]:
     return {
         "server": server_info(),
         "job": JOB.snapshot(),
+        "engine": engine_status(),
         "settings": s,
         "ctx_ceiling": CTX_CEILING,
         "can_load_models": bool(LOADER_URL) or Path(PY).exists(),
@@ -1392,6 +2136,8 @@ def api_state() -> dict[str, Any]:
         "harnesses": [{"id": h["id"], "name": h["name"]} for h in list_harnesses()],
         "harness": {k: v for k, v in get_harness(None, None).items() if k != "id"},
         "harness_components": [{"key": k, "label": lbl} for k, lbl in h2.COMPONENTS],
+        "loop": "legacy" if LEGACY_LOOP else "dsh",
+        "profile": dsh_runtime.PROFILE_NAME,
     }
 
 
@@ -1414,6 +2160,11 @@ def api_ui_state_save(payload: dict = Body(...)) -> dict[str, Any]:
     s["ui_state"] = current
     save_settings(s)
     return {"saved": True, "keys": sorted(current)}
+
+
+@app.get("/api/settings", tags=["system"], summary="Saved settings")
+def api_settings() -> dict[str, Any]:
+    return load_settings()
 
 
 @app.post("/api/settings", tags=["system"], summary="Patch saved settings")
@@ -1512,6 +2263,13 @@ def api_memory(model: str | None = None) -> dict[str, Any]:
     target = model or server_info().get("model") or load_settings().get("model") or ""
     return {"scope": "container", "snapshot": snapshot(),
             "plan": plan(target) if target else None}
+
+
+@app.get("/api/engine", tags=["system"],
+         summary="Engine provisioning: image pull, model download, warm-up")
+def api_engine() -> dict[str, Any]:
+    """Cheap-to-poll view of an engine this container does not supervise."""
+    return engine_status()
 
 
 @app.get("/api/server/job", tags=["server"], summary="Current load/download job")
@@ -1889,12 +2647,108 @@ def api_harness_delete(hid: str) -> dict[str, Any]:
     return {"deleted": hid}
 
 
-@app.get("/api/harnesses/{hid}/preview", tags=["harness"], summary="Compose the system prompt without sending it")
-def api_harness_preview(hid: str, q: str = "") -> dict[str, Any]:
+@app.get("/api/harnesses/{hid}/preview", tags=["harness"],
+         summary="Compose the system prompt without sending it")
+async def api_harness_preview(hid: str, q: str = "") -> dict[str, Any]:
+    """The prompt the mounted composition would actually send, section by section."""
     harness = get_harness(hid)
-    lessons = lessons_for(q) if q else []
-    text, report = h2.compose_system(harness, lessons=lessons, memory_text=memory_context(q) if q else "")
-    return {"harness": harness.get("name"), "system": text, "report": report}
+    params = {**load_settings(), "memory_enabled": bool(q)}
+    holder: dict[str, Any] = {}
+    rows = dsh_rows_for("", harness, params, q, holder)
+    host = dsh_mount(rows, holder)
+    try:
+        prompt = host.root.require("systemPrompt")
+        tools = host.root.require("tools")
+        assembly = await prompt.assemble_async("agent", tools.schemas("agent"))
+        text = prompt.render(assembly)
+        report: dict[str, Any] = {}
+        for section in assembly.report.get("sections", []):
+            report[section["name"]] = {"chars": section["chars"],
+                                       "tokens": section["tokens"]}
+        report["total"] = assembly.report.get("total", {})
+        report["tools"] = assembly.report.get("tools", [])
+        return {
+            "harness": harness.get("name"),
+            "system": text,
+            "report": report,
+            "profile": dsh_runtime.PROFILE_NAME,
+            "services": host.services(),
+            "plugin_count": len(host.dump()["rows"]),
+        }
+    finally:
+        host.dispose()
+
+
+@app.get("/api/harness/profiles", tags=["harness"], summary="Shipped harness profiles")
+def api_harness_profiles() -> list[dict[str, Any]]:
+    from dsh.profiles import PROFILES
+
+    return [p.dump() for p in PROFILES.values()]
+
+
+@app.get("/api/harnesses/{hid}/composition", tags=["harness"],
+         summary="The mounted plugin tree for one harness")
+def api_harness_composition(hid: str) -> dict[str, Any]:
+    harness = get_harness(hid)
+    params = load_settings()
+    holder: dict[str, Any] = {}
+    rows = dsh_rows_for("", harness, params, "", holder)
+    host = dsh_mount(rows, holder)
+    try:
+        report = dsh_runtime.composition_report(rows, host)
+        report["harness"] = {"id": hid, "name": harness.get("name")}
+        return report
+    finally:
+        host.dispose()
+
+
+@app.get("/api/chats/{chat_id}/session", tags=["harness"],
+         summary="Durable session events for a chat (JSONL replay)")
+def api_chat_session(chat_id: str, tail: int = 200) -> dict[str, Any]:
+    path = dsh_session_root() / f"{chat_id}.jsonl"
+    events: list[dict[str, Any]] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return {"chat_id": chat_id, "exists": path.exists(), "count": len(events),
+            "events": events[-max(1, min(tail, 2000)):]}
+
+
+@app.post("/api/chats/{chat_id}/compact", tags=["harness"],
+          summary="Condense this chat's session now (the /compact command)")
+async def api_chat_compact(chat_id: str, payload: dict = Body(default_factory=dict)) -> dict[str, Any]:
+    params = {**load_settings(), **(payload.get("params") or {})}
+    harness = get_harness(None, chat_id)
+    holder: dict[str, Any] = {}
+    host = dsh_mount(dsh_rows_for(chat_id, harness, params, "", holder), holder)
+    try:
+        store = host.root.require("agentSessionStore")
+        compaction = host.root.require("compaction")
+        path = dsh_session_root() / f"{chat_id}.jsonl"
+        if path.exists():
+            session = store.restore(path, ctx=host.root)
+            session.persist, session.path = True, path
+        else:
+            session = store.create(chat_id=chat_id, persist=True, ctx=host.root)
+            with db() as conn:
+                rows = conn.execute(
+                    "SELECT role, content FROM messages WHERE chat_id=? AND "
+                    "role IN ('user','assistant') ORDER BY created", (chat_id,)).fetchall()
+            dsh_runtime.seed_history(session, [{"role": r["role"], "content": r["content"]}
+                                               for r in rows if r["content"]])
+        before = compaction.pressure(session)
+        result = await compaction.condense(session, config={"model": params.get("model")},
+                                           force=True)
+        return {"chat_id": chat_id, "before_tokens": before,
+                "after_tokens": compaction.pressure(session), **result}
+    finally:
+        host.dispose()
 
 
 @app.post("/api/chats/{chat_id}/harness", tags=["harness"], summary="Bind a harness to a chat")
@@ -1944,6 +2798,140 @@ async def api_harness_probe(payload: dict = Body(...)) -> dict[str, Any]:
         "report": report,
         "guardrails": h2.check_output(harness, text),
     }
+
+
+# ---- recursive refinement (Harness² Propose–Probe–Compose) ----------------- #
+
+H2_RUNNING = ("queued", "probing", "proposing", "judging", "composing", "reflecting")
+
+
+@app.post("/api/harness/recursion", tags=["harness"],
+          summary="Refine the selected harness with Propose–Probe–Compose")
+def api_h2_start(payload: dict = Body(default={})) -> dict[str, Any]:
+    if H2_JOB.snapshot()["state"] in H2_RUNNING:
+        raise HTTPException(409, "a harness refinement is already running")
+    if not server_up():
+        raise HTTPException(503, "the model server is down")
+
+    chat_id = payload.get("chat_id")
+    task = str(payload.get("task") or "").strip()
+    if not task and chat_id:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT content FROM messages WHERE chat_id=? AND role='user' "
+                "ORDER BY created DESC LIMIT 1", (chat_id,),
+            ).fetchone()
+        task = (row["content"] if row else "") or ""
+    if not task:
+        raise HTTPException(400, "a task (or a chat with a user turn) is required")
+
+    harness = get_harness(payload.get("harness_id"), chat_id)
+    if not harness.get("id"):
+        raise HTTPException(400, "no harness selected")
+    mode = str(payload.get("mode") or "sequential")
+    if mode not in h2.RECURSION_MODES:
+        raise HTTPException(400, f"mode must be one of {h2.RECURSION_MODES}")
+    try:
+        k = max(1, min(3, int(payload.get("k") or 1)))
+    except (TypeError, ValueError):
+        k = 1
+
+    run_id = h2.new_id()
+    started = h2.now()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO harness_runs (id,harness_id,chat_id,task,mode,k,state,step,"
+            "progress,created) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (run_id, harness.get("id"), chat_id, task[:8000], mode, k,
+             "queued", 0, 0.0, started),
+        )
+    H2_JOB.cancel.clear()
+    H2_JOB._set(state="queued", run_id=run_id, harness_id=harness.get("id"),
+                mode=mode, k=k, step=0, progress=0.0, message="queued",
+                error=None, started=started, finished=None, result=None)
+    run_payload = {
+        "task": task,
+        "mode": mode,
+        "k": k,
+        "harness": harness,
+        "params": payload.get("params") or {},
+        "domain": payload.get("domain") or "general",
+    }
+    H2_JOB.thread = threading.Thread(target=_h2_worker, args=(run_id, run_payload), daemon=True)
+    H2_JOB.thread.start()
+    return {"accepted": True, "run_id": run_id, "mode": mode, "k": k,
+            "harness": harness.get("name")}
+
+
+@app.get("/api/harness/recursion/job", tags=["harness"],
+         summary="Progress of the running Propose–Probe–Compose refinement")
+def api_h2_job() -> dict[str, Any]:
+    return H2_JOB.snapshot()
+
+
+@app.post("/api/harness/recursion/cancel", tags=["harness"],
+          summary="Cancel the current refinement")
+def api_h2_cancel() -> dict[str, Any]:
+    H2_JOB.cancel.set()
+    return {"cancelling": True}
+
+
+@app.get("/api/harness/runs", tags=["harness"], summary="Recent refinement runs")
+def api_h2_runs(limit: int = 20) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id,harness_id,chat_id,task,mode,k,state,step,progress,error,"
+            "created,finished FROM harness_runs ORDER BY created DESC LIMIT ?",
+            (max(1, min(100, limit)),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/harness/runs/{run_id}", tags=["harness"], summary="One refinement run")
+def api_h2_run(run_id: str) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM harness_runs WHERE id=?", (run_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "run not found")
+    out = dict(row)
+    for key in ("baseline", "candidates", "verdict", "result"):
+        try:
+            out[key] = json.loads(out[key]) if out.get(key) else None
+        except Exception:
+            out[key] = None
+    return out
+
+
+@app.post("/api/harness/runs/{run_id}/adopt", tags=["harness"],
+          summary="Save the refined harness as a new harness")
+def api_h2_adopt(run_id: str, payload: dict = Body(default={})) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM harness_runs WHERE id=?", (run_id,)).fetchone()
+    if not row or row["state"] != "ready":
+        raise HTTPException(400, "run is not ready to adopt")
+    try:
+        result = json.loads(row["result"] or "{}")
+    except Exception:
+        raise HTTPException(400, "run has no result")
+    components = h2.normalize(result.get("harness"))
+    base_name = get_harness(row["harness_id"]).get("name") or "Harness"
+    name = str(payload.get("name") or f"{base_name} · refined").strip()[:80]
+    existing = {h["name"] for h in list_harnesses()}
+    if name in existing:
+        name = f"{name} {run_id[:4]}"
+    components["name"] = name
+    hid = h2.new_id()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO harnesses (id,name,components,created,updated) VALUES (?,?,?,?,?)",
+            (hid, name, json.dumps(components), h2.now(), h2.now()),
+        )
+    bound = False
+    if payload.get("bind") and row["chat_id"]:
+        with db() as conn:
+            conn.execute("UPDATE chats SET harness=? WHERE id=?", (hid, row["chat_id"]))
+        bound = True
+    return {"id": hid, "name": name, "bound": bound, "harness": components}
 
 
 # ---- lessons (experience library) ------------------------------------------ #
@@ -2219,8 +3207,166 @@ def api_mcp_call(req: McpToolCall = Body(...)) -> dict[str, Any]:
 # ---- chat ------------------------------------------------------------------ #
 
 
-@app.post("/api/chat", tags=["chat"], summary="Stream a completion (tool harness)")
+@app.post("/api/chat", tags=["chat"], summary="Stream a completion (DeepSeek Harness loop)")
 async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
+    """One turn through the mounted plugin tree.
+
+    The session log is the source of the request: the loop commits the prompt and
+    the accepted users, derives and freezes history, streams, runs the guarded
+    tool pipeline and settles every fact durably. Set WORKBENCH_LEGACY_LOOP=1 to
+    fall back to the pre-harness loop.
+    """
+    if LEGACY_LOOP:
+        return await _legacy_chat(req)
+    payload = req.model_dump()
+    chat_id = payload.get("chat_id")
+    regenerate = bool(payload.get("regenerate"))
+    text = (payload.get("message") or "").strip()
+    attachments = payload.get("attachments") or []
+    if not chat_id or (not text and not regenerate):
+        raise HTTPException(400, "chat_id and message required (or regenerate=true)")
+
+    if not server_up():
+        state_now = JOB.snapshot()["state"]
+        if state_now in ("preparing", "downloading", "starting", "stopping"):
+            raise HTTPException(409, f"model is {state_now} — try again when it reports ready")
+        raise HTTPException(503, "the model server is down — start one from the model switcher")
+
+    settings = load_settings()
+    params = {**settings, **(payload.get("params") or {})}
+    harness = get_harness(None, chat_id)
+    violations = h2.check_input(harness, text)
+    if violations:
+        raise HTTPException(400, "guardrail: " + "; ".join(violations))
+
+    now = time.time()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE chat_id=? AND role IN ('user','assistant') "
+            "ORDER BY created",
+            (chat_id,),
+        ).fetchall()
+        history = [{"role": r["role"], "content": r["content"]} for r in rows if r["content"]]
+        if regenerate:
+            row = conn.execute(
+                "SELECT content FROM messages WHERE chat_id=? AND role='user' ORDER BY created DESC LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(400, "nothing to regenerate")
+            text = row["content"]
+            for i in range(len(history) - 1, -1, -1):
+                if history[i]["role"] == "user":
+                    history = history[:i]
+                    break
+            conn.execute(
+                "DELETE FROM messages WHERE chat_id=? AND created > (SELECT MAX(created) FROM messages "
+                "WHERE chat_id=? AND role='user')",
+                (chat_id, chat_id),
+            )
+            conn.execute("UPDATE chats SET updated=? WHERE id=?", (now, chat_id))
+        else:
+            conn.execute(
+                "INSERT INTO messages (id,chat_id,role,content,created) VALUES (?,?,?,?,?)",
+                (uuid.uuid4().hex[:12], chat_id, "user", text, now),
+            )
+            t = conn.execute("SELECT title FROM chats WHERE id=?", (chat_id,)).fetchone()
+            if t and t["title"] in (None, "", "New chat"):
+                conn.execute("UPDATE chats SET title=?, updated=? WHERE id=?", (text[:60], now, chat_id))
+            else:
+                conn.execute("UPDATE chats SET updated=? WHERE id=?", (now, chat_id))
+
+    holder: dict[str, Any] = {}
+    host = dsh_mount(dsh_rows_for(chat_id, harness, params, text, holder), holder)
+    services = host.services()
+    started = time.time()
+
+    async def gen():
+        collected: list[str] = []
+        reasoning: list[str] = []
+        tool_events: list[dict[str, Any]] = []
+        result: dict[str, Any] = {}
+        error: str | None = None
+        finished = False
+        yield sse("start", {"chat_id": chat_id, "model": params.get("model"), "loop": "dsh"})
+        try:
+            async for frame in dsh_runtime.run_turn(
+                host, chat_id=chat_id, text=text, history=history,
+                attachments=attachments, model=params.get("model") or "",
+                params=params, holder=holder,
+            ):
+                kind = frame.get("type")
+                if kind == "delta":
+                    collected.append(frame["text"])
+                    yield sse("delta", {"text": frame["text"]})
+                elif kind == "reasoning":
+                    reasoning.append(frame["text"])
+                    yield sse("reasoning", {"text": frame["text"]})
+                elif kind == "tool":
+                    tool_events.append({k: frame.get(k) for k in
+                                        ("tool", "server", "arguments", "result", "state", "status")})
+                    yield sse("tool", {k: frame.get(k) for k in
+                                       ("tool", "server", "arguments", "result", "state", "status")})
+                elif kind == "artifact":
+                    yield sse("artifact", frame.get("artifact") or {})
+                elif kind == "done":
+                    result = frame
+                    finished = True
+                elif kind == "rejected":
+                    error = "guardrail: " + (frame.get("reason") or "rejected")
+                    finished = True
+                elif kind == "error":
+                    error = frame.get("message") or "error"
+                    finished = True
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            agent = holder.get("agent")
+            if agent is not None and not finished:
+                agent.cancel(keep_inbox=True)
+            host.dispose()
+
+        if error:
+            yield sse("error", {"message": error})
+            return
+
+        final = (result.get("text") or "".join(collected)).strip()
+        elapsed = result.get("elapsed_s") or round(time.time() - started, 2)
+        usage = result.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0}
+        problems = h2.check_output(harness, final)
+        meta = {
+            "usage": usage,
+            "elapsed_s": elapsed,
+            "model": params.get("model"),
+            "guardrails": problems,
+            "prompt": result.get("prompt") or {},
+            "loop": "dsh",
+            "session_id": result.get("session_id"),
+            "compactions": result.get("compactions", 0),
+            "plugins": len(services),
+        }
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO messages (id,chat_id,role,content,reasoning,tools,meta,created) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex[:12], chat_id, "assistant", final,
+                 "".join(reasoning) or None,
+                 json.dumps({"rounds": result.get("rounds", 0), "events": tool_events})
+                 if tool_events else None,
+                 json.dumps(meta), time.time()),
+            )
+            conn.execute("UPDATE chats SET updated=? WHERE id=?", (time.time(), chat_id))
+        yield sse("done", {"text": final, "usage": usage, "elapsed_s": elapsed,
+                           "rounds": result.get("rounds", 0), "guardrails": problems,
+                           "prompt": result.get("prompt") or {}, "loop": "dsh"})
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _legacy_chat(req: ChatRequest) -> StreamingResponse:
     payload = req.model_dump()
     chat_id = payload.get("chat_id")
     regenerate = bool(payload.get("regenerate"))

@@ -12,12 +12,15 @@ const state = {
   tools: [],
   server: {},
   job: {},
+  engine: {},
   attachments: [],
   optimistic: null,
   personas: [],
   stats: null,
   harnesses: [],
   harness: null,
+  h2RunId: null,
+  h2Timer: null,
   lessons: [],
   paletteIndex: 0,
 };
@@ -64,7 +67,7 @@ async function api(path, opts = {}) {
 const UI_KEY = 'wb.ui.v1';
 const UI_DEFAULTS = {
   chatId: null, tab: 'model', panel: false, sidebar: true, theme: 'dark',
-  density: 'comfortable', sideW: 288, panelW: 410, measure: 830,
+  density: 'comfortable', sideW: 280, panelW: 400, measure: 800,
   modelSource: 'cache', modelTask: '', modelQuery: '',
   harness: null, persona: null, drafts: {}, scroll: {}, filesTab: 'chats',
   jobAck: null,
@@ -188,11 +191,18 @@ function bindLayout() {
   });
 
   const scrim = $('#scrim');
+  const syncScrim = () => {
+    if (!scrim) return;
+    const open = $('#panel').classList.contains('open')
+      || $('#sidebar').classList.contains('open');
+    scrim.hidden = !open;
+  };
   if (scrim) scrim.onclick = () => {
     $('#panel').classList.remove('open');
     $('#app').classList.remove('with-panel');
+    $('#sidebar').classList.remove('open');
     $('#panelResize').hidden = true;
-    scrim.hidden = true;
+    syncScrim();
     UI.set({ panel: false });
   };
 
@@ -491,10 +501,10 @@ function renderMessages() {
 function emptyState() {
   const tpl = document.createElement('div');
   tpl.innerHTML = `
-    <div class="empty">
+    <div class="empty" id="emptyState">
       <div class="empty-logo">S</div>
-      <h2>Local inference, properly harnessed</h2>
-      <p>Streaming, memory, MCP tools, model switching, attachments, personas and a context window you control — all served by SGLang on this Mac.</p>
+      <h2>What can I help with?</h2>
+      <p>Ask anything — streaming answers, memory, MCP tools, model switching and attachments, all served locally by SGLang.</p>
       <div class="suggestions">
         <button class="sug">Explain what the memory store injects into each prompt</button>
         <button class="sug">Which context window can this machine actually handle, and why?</button>
@@ -518,6 +528,7 @@ async function openChat(id) {
   renderMessages();
   renderChats();
   $('#sidebar').classList.remove('open');
+  $('#scrim').hidden = !$('#panel').classList.contains('open');
   // restore what this chat looked like the last time it was open
   const input = $('#input');
   input.value = UI.state.drafts[id] || '';
@@ -534,6 +545,8 @@ async function newChat() {
   $('#chatTitle').textContent = 'New chat';
   renderMessages();
   await loadChats();
+  $('#sidebar').classList.remove('open');
+  $('#scrim').hidden = !$('#panel').classList.contains('open');
   $('#input').focus();
 }
 
@@ -584,6 +597,7 @@ async function sendMessage(textOverride) {
 
   $('#input').value = '';
   autosize();
+  UI.draft(state.chatId, '');   // the prompt left the composer; do not restore it as a draft
   addLocal('user', text + (state.attachments.length ? `\n\n[${state.attachments.length} attachment(s)]` : ''));
   const attachments = [...state.attachments];
   state.attachments = [];
@@ -592,9 +606,23 @@ async function sendMessage(textOverride) {
   const assistant = { id: 'tmp-' + Math.random(), role: 'assistant', content: '', reasoning: '' };
   state.messages.push(assistant);
   const aEl = msgEl(assistant, state.messages.length - 1);
+  aEl.classList.add('streaming');
   $('#messages .thread').appendChild(aEl);
   const bodyEl = aEl.querySelector('.body');
-  bodyEl.innerHTML = '<span class="cursor"></span>';
+  bodyEl.hidden = true;
+  bodyEl.innerHTML = '';
+  const typing = document.createElement('div');
+  typing.className = 'typing';
+  typing.innerHTML = '<span class="td"></span><span class="td"></span><span class="td"></span><em>generating</em>';
+  aEl.querySelector('.bubble').insertBefore(typing, bodyEl);
+  let revealed = false;
+  const reveal = () => {
+    if (revealed) return;
+    revealed = true;
+    typing.classList.add('out');
+    bodyEl.hidden = false;
+    setTimeout(() => typing.remove(), 320);
+  };
   const thinkEl = document.createElement('details');
   thinkEl.className = 'think';
   thinkEl.open = true;
@@ -633,6 +661,7 @@ async function sendMessage(textOverride) {
         if (!ev || !dataRaw) continue;
         const data = JSON.parse(dataRaw);
         if (ev === 'delta') {
+          reveal();
           assistant.content += data.text;
           chars += data.text.length;
           const now = performance.now();
@@ -669,9 +698,11 @@ async function sendMessage(textOverride) {
           notify(`File written: ${data.name}`, '', 3000);
         } else if (ev === 'error') {
           toast(data.message, 'err');
+          reveal();
           assistant.content += `\n\n**Error:** ${data.message}`;
           bodyEl.innerHTML = md(assistant.content);
         } else if (ev === 'done') {
+          reveal();
           assistant.content = data.text || assistant.content;
           assistant.meta = { usage: data.usage, elapsed_s: data.elapsed_s };
           bodyEl.innerHTML = md(assistant.content);
@@ -682,6 +713,7 @@ async function sendMessage(textOverride) {
       }
     }
   } catch (e) {
+    reveal();
     if (e.name === 'AbortError') {
       assistant.content += '\n\n_[stopped]_';
       bodyEl.innerHTML = md(assistant.content);
@@ -969,7 +1001,7 @@ function applySwitchingUI() {
   } else {
     chip.classList.remove('switching');
     $('#input').disabled = false;
-    $('#input').placeholder = 'Message the model…  (⏎ send · ⇧⏎ newline · ⌘K palette)';
+    $('#input').placeholder = 'Send a message…  (⏎ send · ⇧⏎ newline)';
     $('#sendBtn').disabled = false;
   }
 }
@@ -1006,19 +1038,51 @@ async function switchModel(model) {
 
 
 /* --------------------------- model load banner --------------------------- */
+// An engine this container does not supervise (compose `gpu` profile, host
+// loader, remote box) still has a lifecycle worth showing: image pull, model
+// download, warm-up. /api/state carries it as `engine`.
+const ENGINE_ACTIVE = ['pulling', 'downloading', 'starting', 'waiting'];
+const ENGINE_LABELS = {
+  pulling: 'pulling image',
+  downloading: 'downloading model',
+  starting: 'starting engine',
+  waiting: 'waiting for engine',
+  failed: 'engine failed',
+  ready: 'engine ready',
+};
+let engineWatched = false;
+
+const engineLabel = (e) => ENGINE_LABELS[(e || {}).phase] || (e || {}).phase || 'engine';
+const engineMessage = (e) => {
+  const msg = String((e || {}).message || '');
+  const norm = (s) => String(s || '').toLowerCase()
+    .replace(/\b(the|a|an)\b/g, '').replace(/[^a-z]+/g, ' ').trim();
+  return norm(msg) === norm(engineLabel(e)) ? '' : msg;
+};
+const fmtGB = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : `${Math.max(1, Math.round(n / 1e6))} MB`;
+const fmtRate = (n) => n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB/s` : `${Math.max(1, Math.round(n / 1e3))} kB/s`;
+
 function renderJobBanner() {
   const bar = $('#jobBanner');
   if (!bar) return;
   const j = state.job || {};
+  const e = state.engine || {};
   const active = JOB_ACTIVE.includes(j.state);
   const failed = j.state === 'failed' && !jobErrDismissed;
+  const engPhase = e.phase || '';
+  const engActive = ENGINE_ACTIVE.includes(engPhase);
+  const engFailed = engPhase === 'failed';
 
-  // A finished load is history, not a notification. The loader keeps reporting "ready"
-  // forever, so acknowledging by (state|model|finished) is what stops it re-appearing on
-  // every poll, every page load and every refresh of another tab.
-  if (!active && !failed) {
+  if (engActive) engineWatched = true;
+  if (!active && !failed && !engActive && !engFailed && engPhase === 'ready' && engineWatched) {
+    engineWatched = false;
+    notify(`engine ready${e.model ? ` · ${String(e.model).split('/').pop()}` : ''}`);
+  }
+
+  if (!active && !failed && !engActive && !engFailed) {
     bar.hidden = true;
     bar.classList.remove('err', 'done');
+    bar.title = '';
     const key = `${j.state}|${j.model || ''}|${j.finished || 0}`;
     if (j.state === 'ready' && j.finished && key !== UI.state.jobAck) {
       UI.set({ jobAck: key });
@@ -1033,11 +1097,43 @@ function renderJobBanner() {
     return;
   }
 
+  // Engine provisioned elsewhere: no cancel, no local log — just progress.
+  if (!active && !failed && (engActive || engFailed)) {
+    const pct = Number.isFinite(e.progress) ? Math.max(0, Math.min(100, e.progress)) : null;
+    bar.hidden = false;
+    bar.classList.toggle('err', engFailed);
+    bar.classList.remove('done');
+    bar.title = e.hint || '';
+    $('#jbState').textContent = engineLabel(e);
+    $('#jbModel').textContent = e.model ? String(e.model).split('/').pop() : '';
+    $('#jbCancel').hidden = true;
+    $('#jbLog').hidden = true;
+
+    const fill = $('#jbFill');
+    fill.classList.toggle('indet', pct === null);
+    fill.style.width = pct === null ? '' : `${pct}%`;
+
+    const parts = [];
+    if (e.bytes_done) {
+      parts.push(`${fmtGB(e.bytes_done)}${e.bytes_total ? ` / ${fmtGB(e.bytes_total)}` : ''}`);
+    }
+    if (e.rate_bps) parts.push(fmtRate(e.rate_bps));
+    if (e.elapsed_s) parts.push(`${Math.round(e.elapsed_s)}s`);
+    const extra = engPhase === 'pulling' ? engineMessage(e) : '';
+    if (!e.bytes_done && extra) parts.push(extra);
+    if (engPhase === 'waiting' && e.hint) parts.push(e.hint);
+    if (engFailed && e.hint) parts.push(e.hint);
+    $('#jbNum').textContent = parts.join(' · ');
+    return;
+  }
+
+  $('#jbLog').hidden = false;
   if (active) jobWatched = true;
 
   bar.hidden = false;
   bar.classList.toggle('err', !!failed);
   bar.classList.remove('done');
+  bar.title = '';
   $('#jbState').textContent = failed ? 'failed' : j.state;
   $('#jbModel').textContent = j.model ? j.model.split('/').pop() : '';
   $('#jbCancel').hidden = !active;
@@ -1070,19 +1166,29 @@ async function refreshState() {
     state.tools = s.tools || [];
     state.server = s.server || {};
     state.job = s.job || {};
+    state.engine = s.engine || {};
     state.canLoadModels = s.can_load_models !== false;
     const up = !!s.server?.up;
     const jobActive = JOB_ACTIVE.includes(state.job.state);
+    const eng = state.engine;
+    const engActive = ENGINE_ACTIVE.includes(eng.phase);
+    const engFailed = eng.phase === 'failed';
+    const engPct = Number.isFinite(eng.progress) ? ` ${Math.round(eng.progress)}%` : '';
 
-    $('#statusDot').className = 'dot ' + (jobActive ? 'busy' : up ? 'on' : 'off');
+    $('#statusDot').className = 'dot ' + (jobActive || engActive ? 'busy' : up ? 'on' : 'off');
     $('#statusText').textContent = jobActive
       ? `${state.job.state} ${state.job.progress ? Math.round(state.job.progress) + '%' : ''}`.trim()
+      : engActive ? `${engineLabel(eng)}${engPct}`.trim()
+      : engFailed ? 'engine failed'
       : up ? `${((s.server && s.server.model) || state.settings.model || '').split('/').pop()} · up` : 'server down';
+    $('#statusText').title = engActive || engFailed ? (eng.hint || eng.message || '') : '';
     $('#brandSub').textContent = up
       ? `local · Metal · ${(s.server?.context_length || state.settings.context_length).toLocaleString()} ctx`
+      : engActive ? `local · ${engineLabel(eng)}${engPct}`
+      : engFailed ? 'local · engine failed'
       : 'local · Metal · offline';
 
-    $('#modelChip').textContent = s.server?.model || s.settings.model;
+    $('#modelChip').textContent = s.server?.model || (engActive && eng.model) || state.settings.model;
     $('#ctxChip').textContent = `ctx ${Number(s.server?.context_length || s.settings.context_length).toLocaleString()}`;
     $('#memChip').textContent = s.settings.memory_enabled ? 'memory on' : 'memory off';
     if (s.harness && $('#harnessChip')) $('#harnessChip').textContent = `harness ${s.harness.name}`;
@@ -1090,11 +1196,14 @@ async function refreshState() {
     $('#toolCount').textContent = state.tools.length;
     $('#toolsToggle').classList.toggle('on', !!s.settings.tools_enabled);
     $('#thinkToggle').classList.toggle('on', !!s.settings.enable_thinking);
-    $('#jobChip').hidden = !jobActive;
-    if (jobActive) {
+    const chipBusy = jobActive || engActive;
+    $('#jobChip').hidden = !(chipBusy || engFailed);
+    if (chipBusy || engFailed) {
       const pct = state.job.state === 'downloading' ? ` ${Math.round(state.job.progress || 0)}%` : '';
-      $('#jobChip').className = 'chip busy';
-      $('#jobChip').textContent = `${state.job.state}${pct}`;
+      $('#jobChip').className = 'chip ' + (engFailed ? 'err' : 'busy');
+      $('#jobChip').textContent = jobActive
+        ? `${state.job.state}${pct}`
+        : `${engFailed ? 'engine failed' : engineLabel(eng) + engPct}`.trim();
     }
     if (JOB_ACTIVE.includes(state.job.state)) jobErrDismissed = false;
     // rendering problems are UI problems: they must not flip the connection pill
@@ -1114,32 +1223,43 @@ async function refreshState() {
 
 function renderServerCard() {
   const j = state.job || {};
+  const e = state.engine || {};
   const s = state.server || {};
   const up = !!s.up;
-  $('#scDot').className = 'dot ' + (JOB_ACTIVE.includes(j.state) ? 'busy' : up ? 'on' : 'off');
-  $('#scModel').textContent = s.model || state.settings.model || '—';
+  const engActive = ENGINE_ACTIVE.includes(e.phase);
+  const engPct = Number.isFinite(e.progress) ? Math.max(0, Math.min(100, e.progress)) : null;
+  $('#scDot').className = 'dot ' + (JOB_ACTIVE.includes(j.state) || engActive ? 'busy' : up ? 'on' : 'off');
+  $('#scModel').textContent = s.model || e.model || state.settings.model || '—';
   const pool = Number(s.max_total_num_tokens || 0);
   const poolTxt = pool ? ` · pool ${pool.toLocaleString()} tok` : '';
   $('#scMeta').textContent = up
     ? `ctx ${Number(s.context_length || 0).toLocaleString()}${poolTxt} · RSS ${s.rss_gb ?? '?'} GB`
-    : (j.state !== 'idle' ? `${j.state}: ${j.message || ''}` : 'server not running');
+    : engActive
+      ? `${engineLabel(e)}${engPct === null ? '' : ` ${Math.round(engPct)}%`}${engPhase === 'pulling' && engineMessage(e) ? ` · ${engineMessage(e)}` : ''}`
+      : e.phase === 'failed'
+        ? `engine failed${e.hint ? `: ${e.hint}` : ''}`
+        : (j.state !== 'idle' ? `${j.state}: ${j.message || ''}` : 'server not running');
   $('#scMeta').classList.toggle('warn', up && pool > 0 && pool < 4096);
   $('#scMeta').title = up && pool > 0 && pool < 4096
     ? 'KV pool is too small for real conversations — lower the context window or pick a smaller model'
-    : '';
+    : (e.hint || '');
 
   const prog = $('#loadProgress');
   const bar = $('#loadBar');
   const active = JOB_ACTIVE.includes(j.state);
-  prog.hidden = !active;
-  bar.style.width = `${Math.round(j.progress || 0)}%`;
+  prog.hidden = !(active || engActive);
+  bar.classList.toggle('indet', engActive && engPct === null);
+  bar.style.width = `${Math.round(engActive ? (engPct ?? 0) : (j.progress || 0))}%`;
 
   const err = $('#loadError');
   if (j.state === 'failed' && j.error) { err.hidden = false; err.textContent = j.error; }
+  else if (e.phase === 'failed' && e.hint) { err.hidden = false; err.textContent = e.hint; }
   else err.hidden = true;
 
   $('#cancelLoad').hidden = !active;
-  $('#stopServer').disabled = !up && !active;
+  $('#stopServer').disabled = !up || state.canLoadModels === false;
+  $('#stopServer').title = state.canLoadModels === false
+    ? 'the engine is managed outside the app' : '';
 }
 
 function setVal(sel, v) { const el = $(sel); if (el) el.value = v; }
@@ -1225,6 +1345,16 @@ async function loadModels() {
 }
 
 async function startServer(model) {
+  if (state.canLoadModels === false) {
+    const e = state.engine || {};
+    const busy = ENGINE_ACTIVE.includes(e.phase);
+    const pct = Number.isFinite(e.progress) ? ` ${Math.round(e.progress)}%` : '';
+    toast(busy
+      ? `${engineLabel(e)}${pct} — wait for the engine before loading another model`
+      : 'model loading is disabled here: the engine is managed outside the app (compose MODEL in .env)', 'err');
+    openPanel('model');
+    return;
+  }
   openPanel('model');
   $('#jobBanner').hidden = false;
   const payload = {
@@ -1400,6 +1530,7 @@ function fillHarnessForm() {
   $('#hRequireJson').checked = !!rules.require_json;
   $('#hLessons').checked = rules.include_lessons !== false;
   $('#hReport').textContent = `${h.name} · ${JSON.stringify(h).length} chars of definition`;
+  loadComposition();
 }
 
 function parseField(id) {
@@ -1450,9 +1581,66 @@ async function previewHarness() {
   const h = currentHarness();
   const q = $('#input').value.trim();
   const r = await api(`/api/harnesses/${h.id}/preview?q=${encodeURIComponent(q)}`);
-  const rows = Object.entries(r.report).filter(([k]) => k !== 'total')
+  const rows = Object.entries(r.report)
+    .filter(([k, v]) => k !== 'total' && v && typeof v === 'object' && 'tokens' in v)
     .map(([k, v]) => `${k}: ${v.tokens} tok`).join(' · ');
-  $('#hReport').textContent = `${rows}\n\n${r.system}`;
+  const plugins = r.plugin_count ? `\n${r.profile} · ${r.plugin_count} plugins · ${r.services.length} services` : '';
+  $('#hReport').textContent = `${rows}${plugins}\n\n${r.system}`;
+}
+
+/* ----------------------- composition (DSH plugin tree) ----------------------- */
+let COMPOSITION = null;
+
+async function loadComposition(force = false) {
+  const h = currentHarness();
+  if (!h.id) return;
+  if (COMPOSITION && COMPOSITION.harness_id === h.id && !force) { renderComposition(COMPOSITION); return; }
+  try {
+    const r = await api(`/api/harnesses/${h.id}/composition`);
+    COMPOSITION = { harness_id: h.id, ...r };
+    renderComposition(COMPOSITION);
+  } catch (e) {
+    $('#composeSub').textContent = e.message;
+  }
+}
+
+function renderComposition(r) {
+  $('#composeSub').textContent = `${r.profile} · ${(r.bundles || []).join(' + ')} · ${r.rows.length} plugins`;
+  const state = $('#composeState');
+  state.textContent = r.failed.length ? `${r.failed.length} failed` : `${r.services.length} services`;
+  state.className = 'badge ' + (r.failed.length ? 'err' : 'dl');
+  const box = $('#composeRows');
+  box.innerHTML = '';
+  for (const row of r.rows) {
+    const chip = document.createElement('button');
+    chip.className = 'rc-chip';
+    chip.innerHTML = `<b>${esc(row.name)}</b> <span class="cstate ${esc(row.state)}">${esc(row.state)}</span>`;
+    chip.title = (row.provides && row.provides.length) ? `provides: ${row.provides.join(', ')}` : row.id;
+    chip.onclick = () => {
+      const log = $('#composeLog');
+      log.hidden = !log.hidden;
+      log.textContent = JSON.stringify({
+        id: row.id, name: row.name, state: row.state,
+        provides: row.provides, config: row.config,
+      }, null, 2);
+    };
+    box.appendChild(chip);
+  }
+  if (r.failed.length) {
+    const log = $('#composeLog');
+    log.hidden = false;
+    log.textContent = r.failed.map((f) => `${f.id}: ${f.error}`).join('\n');
+  }
+}
+
+async function compactChat() {
+  if (!state.chatId) return toast('Open a chat first', 'err');
+  toast('condensing…');
+  try {
+    const r = await api(`/api/chats/${state.chatId}/compact`, { method: 'POST', body: {} });
+    if (!r.condensed) return toast(`nothing to condense (${r.before_tokens} tok)`);
+    toast(`condensed ${r.items || 0} items · ${r.before_tokens}→${r.after_tokens} tok`);
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 async function probeHarness() {
@@ -1472,6 +1660,151 @@ async function bindHarness() {
   await api(`/api/chats/${state.chatId}/harness`, { method: 'POST', body: { harness_id: h.id } });
   toast(`Chat bound to ${h.name}`);
   refreshState();
+}
+
+/* ------------------- recursive refinement (Harness² PPC) ------------------- */
+const H2_ACTIVE = ['queued', 'probing', 'proposing', 'judging', 'composing', 'reflecting'];
+
+function lastUserTask() {
+  const m = [...(state.messages || [])].reverse().find((x) => x.role === 'user');
+  return (m && m.content) || '';
+}
+
+function renderH2Result(result, job) {
+  $('#rcResult').hidden = false;
+  const v = result.verdict || {};
+  const lesson = (result.lesson && result.lesson.lesson) || '';
+  const winner = v.winner || '—';
+  const hasEdits = (result.steps || []).some((s) => (s.edits || []).length);
+  const adoptable = result.changed === true || (result.changed === undefined && hasEdits);
+  const held = adoptable ? '' : '\nbaseline held · no harness change to save';
+  $('#rcVerdict').textContent =
+    `winner: ${winner} · ${v.rationale || 'no judge note'}` + (lesson ? `\nlesson: ${lesson}` : '') + held;
+  $('#rcAdopt').disabled = !adoptable;
+  $('#rcAdoptBind').disabled = !adoptable;
+  $('#rcChips').innerHTML = (result.candidates || []).map((c) => {
+    const guard = c.guardrails && c.guardrails.length ? ' · ⚠ guardrail' : '';
+    return `<span class="rc-chip" title="${esc(c.note || '')}"><b>${esc(c.id)}</b>` +
+      ` ${c.score ?? '—'}${guard}</span>`;
+  }).join('');
+  $('#rcPreview').textContent = result.system_preview || '';
+  state.h2RunId = (job && job.run_id) || state.h2RunId;
+}
+
+function renderH2Job(job) {
+  const stateName = job.state || 'idle';
+  const active = H2_ACTIVE.includes(stateName);
+  const badge = $('#rcState');
+  badge.textContent = stateName;
+  badge.className = 'badge ' + (active ? 'busy' : stateName === 'ready' ? 'dl' : stateName === 'failed' ? 'err' : '');
+  const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
+  $('#rcProgress').hidden = !(active || stateName === 'ready');
+  $('#rcBar').style.width = `${progress}%`;
+  $('#rcLog').textContent = job.error || job.message
+    || (stateName === 'idle' ? 'Run one Propose–Probe–Compose step to adapt this harness to the current task.' : '…');
+  $('#rcRun').disabled = active;
+  $('#rcCancel').hidden = !active;
+  if (stateName === 'ready' && job.result) {
+    state.h2RunId = job.run_id;
+    renderH2Result(job.result, job);
+  } else if (stateName === 'failed' || stateName === 'cancelled') {
+    $('#rcResult').hidden = true;
+  }
+}
+
+async function loadH2Job() {
+  const task = lastUserTask();
+  const input = $('#rcTask');
+  if (input) {
+    input.placeholder = task
+      ? `default: ${task.replace(/\s+/g, ' ').slice(0, 90)}${task.length > 90 ? '…' : ''}`
+      : 'Task — defaults to the last user turn';
+  }
+  try {
+    let job = await api('/api/harness/recursion/job');
+    const current = currentHarness();
+    if (job.state === 'ready' && job.harness_id && job.harness_id !== current.id) {
+      job = { ...job, state: 'idle', result: null, progress: 0, message: '' };
+      $('#rcResult').hidden = true;
+      state.h2RunId = null;
+    }
+    renderH2Job(job);
+    if (H2_ACTIVE.includes(job.state)) { pollH2(); return; }
+    // After a reload the in-memory job is idle but the run is still in SQLite.
+    if (job.state === 'idle') {
+      $('#rcResult').hidden = true;
+      state.h2RunId = null;
+      const runs = await api('/api/harness/runs?limit=8');
+      const last = runs.find((r) => r.state === 'ready' && r.harness_id === current.id);
+      if (last) {
+        const run = await api(`/api/harness/runs/${last.id}`);
+        if (run.result) {
+          state.h2RunId = run.id;
+          renderH2Result(run.result, { run_id: run.id });
+          $('#rcLog').textContent =
+            `last run · ${run.mode} k=${run.k} · ${new Date(run.created * 1000).toLocaleString()}`;
+          const badge = $('#rcState');
+          badge.textContent = 'ready';
+          badge.className = 'badge dl';
+          $('#rcProgress').hidden = false;
+          $('#rcBar').style.width = '100%';
+        }
+      }
+    }
+  } catch (e) { /* harness panel stays usable */ }
+}
+
+async function pollH2() {
+  clearTimeout(state.h2Timer);
+  try {
+    const job = await api('/api/harness/recursion/job');
+    renderH2Job(job);
+    if (H2_ACTIVE.includes(job.state)) state.h2Timer = setTimeout(pollH2, 1200);
+  } catch (e) {
+    state.h2Timer = setTimeout(pollH2, 2500);
+  }
+}
+
+async function startH2() {
+  const h = currentHarness();
+  if (!h.id) return toast('Select a harness first', 'err');
+  const task = $('#rcTask').value.trim() || lastUserTask();
+  if (!task) return toast('Open a chat with a user turn, or type a task', 'err');
+  $('#rcRun').disabled = true;
+  $('#rcResult').hidden = true;
+  $('#rcLog').textContent = 'starting…';
+  try {
+    const r = await api('/api/harness/recursion', {
+      method: 'POST',
+      body: {
+        chat_id: state.chatId,
+        harness_id: h.id,
+        task,
+        mode: $('#rcMode').value,
+        k: +$('#rcK').value || 1,
+      },
+    });
+    state.h2RunId = r.run_id;
+    toast(`refining ${h.name} (${r.mode}, k=${r.k})`);
+    pollH2();
+  } catch (e) {
+    $('#rcRun').disabled = false;
+    toast(e.message, 'err');
+  }
+}
+
+async function adoptH2(bind) {
+  if (!state.h2RunId) return toast('Run a refinement first', 'err');
+  try {
+    const r = await api(`/api/harness/runs/${state.h2RunId}/adopt`, {
+      method: 'POST', body: { bind: !!bind },
+    });
+    await loadHarnesses();
+    $('#harnessSelect').value = r.id;
+    fillHarnessForm();
+    if (bind) refreshState();
+    toast(`saved ${r.name}${bind ? ' · bound to this chat' : ''}`);
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 async function loadLessons() {
@@ -1609,6 +1942,7 @@ function paletteItems() {
     { label: 'Open prompts', kind: 'action', run: () => openPanel('prompts') },
     { label: 'Open MCP servers', kind: 'action', run: () => openPanel('mcp') },
     { label: 'Open harness editor', kind: 'action', run: () => openPanel('harness') },
+    { label: 'Condense this chat (/compact)', kind: 'action', run: compactChat },
     { label: 'Open files', kind: 'action', run: () => openPanel('files') },
     { label: 'Usage stats', kind: 'action', run: showStats },
     { label: 'Server logs', kind: 'action', run: showLogs },
@@ -1662,7 +1996,7 @@ function openPanel(tab = 'model') {
   if (tab === 'prompts') loadPrompts();
   if (tab === 'mcp') loadMcp();
   if (tab === 'params') loadPersonas();
-  if (tab === 'harness') { loadHarnesses(); loadLessons(); }
+  if (tab === 'harness') { loadHarnesses(); loadLessons(); loadH2Job(); }
   if (tab === 'files') loadFiles();
 }
 
@@ -1733,9 +2067,13 @@ function bind() {
     $('#panel').classList.remove('open');
     $('#app').classList.remove('with-panel');
     $('#panelResize').hidden = true;
+    $('#scrim').hidden = !$('#sidebar').classList.contains('open');
     UI.set({ panel: false });
   };
-  $('#toggleSidebar').onclick = () => $('#sidebar').classList.toggle('open');
+  $('#toggleSidebar').onclick = () => {
+    const open = $('#sidebar').classList.toggle('open');
+    $('#scrim').hidden = !(open || $('#panel').classList.contains('open'));
+  };
   $$('#panelTabs button').forEach((b) => (b.onclick = () => openPanel(b.dataset.tab)));
 
   $('#modelChip').onclick = (e) => { e.stopPropagation(); openModelMenu(); };
@@ -1878,10 +2216,21 @@ function bind() {
   };
 
   // harness tab
-  $('#harnessSelect').onchange = fillHarnessForm;
+  $('#harnessSelect').onchange = async () => { fillHarnessForm(); await loadH2Job(); };
   $('#hSave').onclick = saveHarness;
   $('#hPreview').onclick = () => previewHarness().catch((e) => toast(e.message, 'err'));
+  $('#composeRefresh').onclick = () => loadComposition(true).catch((e) => toast(e.message, 'err'));
+  $('#compactNow').onclick = compactChat;
   $('#hProbe').onclick = probeHarness;
+  $('#rcRun').onclick = startH2;
+  $('#rcCancel').onclick = async () => {
+    try {
+      await api('/api/harness/recursion/cancel', { method: 'POST', body: {} });
+      toast('cancelling…');
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  $('#rcAdopt').onclick = () => adoptH2(false);
+  $('#rcAdoptBind').onclick = () => adoptH2(true);
   $('#hBind').onclick = bindHarness;
   $('#harnessNew').onclick = async () => {
     const name = prompt('Harness name');
@@ -2017,16 +2366,20 @@ async function boot() {
         renderServerCard();
         applySwitchingUI();
         const activeJob = JOB_ACTIVE.includes(j.state);
-        $('#statusDot').className = 'dot ' + (activeJob ? 'busy' : (state.server && state.server.up ? 'on' : 'off'));
+        const eng = state.engine || {};
+        const engActive = ENGINE_ACTIVE.includes(eng.phase);
+        const engPct = Number.isFinite(eng.progress) ? ` ${Math.round(eng.progress)}%` : '';
+        $('#statusDot').className = 'dot ' + (activeJob || engActive ? 'busy' : (state.server && state.server.up ? 'on' : 'off'));
         const pctTxt = j.state === 'downloading' && j.progress ? ` ${Math.round(j.progress)}%` : '';
         $('#statusText').textContent = activeJob
           ? `${j.state}${pctTxt}`
+          : engActive ? `${engineLabel(eng)}${engPct}`.trim()
           : (state.server && state.server.up ? `${(state.server.model || state.settings.model || '').split('/').pop()} · up` : 'server down');
-        $('#jobChip').hidden = !activeJob;
-        if (activeJob) {
+        $('#jobChip').hidden = !(activeJob || engActive);
+        if (activeJob || engActive) {
           const pct = j.state === 'downloading' ? ` ${Math.round(j.progress || 0)}%` : '';
           $('#jobChip').className = 'chip busy';
-          $('#jobChip').textContent = `${j.state}${pct}`;
+          $('#jobChip').textContent = activeJob ? `${j.state}${pct}` : `${engineLabel(eng)}${engPct}`.trim();
         }
       }
     } catch (e) { /* workbench offline */ }
@@ -2034,7 +2387,9 @@ async function boot() {
 
   (async function tick() {
     try { await refreshState(); } catch (e) { /* offline */ }
-    setTimeout(tick, JOB_ACTIVE.includes(state.job.state) ? 1000 : 8000);
+    const fast = JOB_ACTIVE.includes(state.job.state)
+      || ENGINE_ACTIVE.includes((state.engine || {}).phase);
+    setTimeout(tick, fast ? 1500 : 8000);
   })();
 
   const chatParam = new URLSearchParams(location.search).get('chat');

@@ -36,6 +36,10 @@ services:
       WORKBENCH_CORS_ORIGINS: ${WORKBENCH_CORS_ORIGINS:-*}
       WORKBENCH_DATA: /data
       WORKBENCH_ROOT: /app
+      # The model the external engine is expected to serve. Lets the UI show
+      # "downloading Qwen/Qwen3-4B 42%" even though compose, not this app,
+      # owns the engine process.
+      WORKBENCH_ENGINE_MODEL: ${MODEL:-}
       SGLANG_PYTHON: ${SGLANG_PYTHON:-}
       HF_HOME: /hf-cache
       TZ: ${TZ:-UTC}
@@ -75,6 +79,8 @@ services:
       - 0.0.0.0
       - --port
       - "30000"
+      - --context-length
+      - ${CTX:-12288}
       - --mem-fraction-static
       - ${MEM_FRACTION:-0.85}
     ports:

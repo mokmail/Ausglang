@@ -1,8 +1,8 @@
 # SGLang Workbench
 
 A local LLM workbench over an SGLang (OpenAI-compatible) server: professional chat UI,
-long-term memory, MCP tools with an agent harness, model switching, attachments,
-personas, prompt library and a documented FastAPI.
+long-term memory, MCP tools with an agent harness, **recursive harness refinement**,
+model switching, attachments, personas, prompt library and a documented FastAPI.
 
 The workbench is **GPU-agnostic** — it speaks HTTP to SGLang, so the same image runs
 on macOS, Windows and Linux while the Metal/CUDA stack stays where it works.
@@ -161,9 +161,23 @@ from other machines.
 ### 3. Linux + NVIDIA only: SGLang in its own container
 
 ```bash
+./start-gpu.sh                     # recommended: reports pull/warm-up progress
+# or:
 MODEL=Qwen/Qwen3-1.7B docker compose --profile gpu up -d
 UPSTREAM=http://sglang:30000 docker compose up -d workbench
 ```
+
+`start-gpu.sh` streams image-pull progress from the Docker Engine API and writes
+`data/engine-status.json`; the Workbench renders it as one banner across every tab:
+**pulling image** (real %) → **downloading model** → **starting engine** → **ready**.
+Model download progress is read from the HF cache, so it appears even when compose
+was started by hand. The engine's lifecycle is owned by compose, so "Load model"
+stays disabled (`MODEL=` in `.env` changes it); the banner still tells you what the
+engine is doing.
+
+The weights are ~8 GB: if the repo lives on a small partition, point
+`HF_CACHE_DIR` in `.env` at a larger filesystem (for example
+`/var/tmp/sglang-hf-cache`); both the engine and the Workbench mount it.
 
 Requires the NVIDIA container toolkit. Not possible on macOS/Windows: containers
 there have no Metal and no CUDA.
@@ -238,8 +252,8 @@ Set `WORKBENCH_API_KEY` and every `/api/*` call must send `X-API-Key: <value>`.
 [Harness²](https://github.com/google-research/harness2) defines a harness as the
 eight editable components around a model and shows that refining them — not the
 weights — is what turns a model into a working agent. This app implements the
-component model and the guardrail/experience half of that idea; the recursive
-search stays in the research code.
+component model, the guardrail/experience half, and a local **Propose–Probe–Compose**
+loop that runs against the current task instead of a benchmark rollout.
 
 | Component | Here | What it does |
 |---|---|---|
@@ -257,23 +271,48 @@ Harnesses are stored in SQLite, bound per chat, and composable from the UI's
 composed system prompt, and **probes** a candidate harness against the chat's last
 turn so two variants can be compared before you bind one.
 
+### Recursive refinement (Propose–Probe–Compose)
+
+The **Recursive refinement** card in the Harness tab runs the task-level recursion
+locally:
+
+1. **Probe** — run the selected harness on the current task (last user turn, or a
+   task you type) with tools disabled, so the harness is what changes.
+2. **Propose** — ask the model for one or more harness edits as strict JSON:
+   append/replace a section, add a skill/script/subagent/plugin, or add tool
+   guidance. Edits that target the answer instead of the harness are rejected.
+3. **Probe candidates** — run the same task under each candidate. A deterministic
+   task-focus candidate is always included, so a weak model that writes prose
+   instead of an edit still produces a usable contrast.
+4. **Judge** — contrast the outputs without ground truth (fit, usability,
+   guardrail flags) and pick a winner.
+5. **Compose** — synthesize the next harness from the winning edits and the
+   contrasts; invalid composer output falls back to the judged candidate.
+6. **Reflect** — extract one transferable lesson into the experience library,
+   closing the harnessing-level recursion for the next task.
+
+`sequential` carries the refined harness and evidence through `k` steps;
+`parallel` proposes `k` general and `k` domain-specific candidates, probes them
+together, and composes once. Results (baseline, candidates, scores, lesson, and
+the composed system prompt) are stored in `harness_runs` and can be adopted as a
+new harness or adopted + bound to the chat. If the local model returns unusable
+JSON, the loop records the fallback and still produces a validated result — it
+never writes a malformed harness.
+
 ### Lessons (the experience library)
 
 `cue / lesson / evidence / confidence` rows, keyword-ranked against each message
 and injected into context. `POST /api/lessons/reflect` asks the model to extract a
-transferable lesson from the last exchange — the useful half of Harness²'s
-"harnessing-level recursion" without needing benchmarks.
+transferable lesson from the last exchange; the recursive loop also writes one per
+run.
 
 ### What is deliberately not here
 
-- **Recursive Propose–Probe–Compose search** over candidate harnesses (`--k`,
-  parallel/sequential) with an LLM judge and tree selection — that is a research
-  loop over benchmark rollouts; a chat app has a human in the seat instead, so the
-  probe is manual and the user composes.
-- **Benchmark adapters** (JobBench / LAB / WorkBuddy) and grader-verdict leak
-  checks — no graders exist here.
+- **Benchmark rollouts** (JobBench / LAB / WorkBuddy) and grader-verdict leak
+  checks — the loop runs on your live chat task, not a benchmark with graders.
 - **Executor substrates** (OpenCode / Codex) — the workbench *is* the executor and
   speaks to any OpenAI-compatible server.
+- **Weight updates** — only the harness changes.
 
 ### Endpoints
 
@@ -284,10 +323,68 @@ PATCH  /api/harnesses/{id}                update components
 POST   /api/harnesses/{id}/duplicate
 DELETE /api/harnesses/{id}
 GET    /api/harnesses/{id}/preview?q=     composed system prompt + token report
+GET    /api/harnesses/{id}/composition    the mounted plugin tree (profile, rows, services)
+GET    /api/harness/profiles              shipped profiles and their bundles
 POST   /api/chats/{id}/harness            bind a harness to a chat
+POST   /api/chats/{id}/compact            condense this chat's session now (/compact)
+GET    /api/chats/{id}/session?tail=      durable session events (JSONL replay)
 POST   /api/harness/probe                 run the last user turn under a candidate
+POST   /api/harness/recursion             start Propose–Probe–Compose
+GET    /api/harness/recursion/job         progress of the running refinement
+POST   /api/harness/recursion/cancel      cancel the refinement
+GET    /api/harness/runs                  recent refinement runs
+GET    /api/harness/runs/{id}             one run: baseline, probes, verdict, result
+POST   /api/harness/runs/{id}/adopt       save the refined harness (optional bind)
 GET/POST/DELETE /api/lessons              experience library
 POST   /api/lessons/reflect               extract a lesson from the last exchange
+```
+
+---
+
+## DeepSeek Harness (the loop that runs your chats)
+
+The chat loop is a port of [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+(`dsh`), the plugin-composed agent harness: **everything is a plugin**, and a
+composition is an ordered list of rows. The eight harness components above are
+mounted *as plugins beside* the loop, so the harness you edit in the UI is the
+actual composition the model ran under.
+
+| dsh concept | Here |
+|---|---|
+| plugin kernel | `dsh/kernel.py` — services, typed events, reversible effects, deferred injection, scoped registration |
+| profile / bundle / patch | `dsh/profiles.py` — `workbench`, `headless`, `sdk-minimal`; rows patched by id |
+| session log | `dsh/session.py` — append-only JSONL events; `derive_messages()` is the model history |
+| prompt assembly | `dsh/prompt.py` — ordered sections, `{{variables}}`, tool schemas, strict rendering |
+| tool pipeline | `dsh/tools.py` — `tools/pre-execute` → guards → `tools/execute` → `tools/post-execute` → `tools/result` |
+| agent loop | `dsh/loop.py` — turn/step machine, inbox, `agent/pre-step`, `agent/request`, streaming, barriers + parallel pool |
+| compaction | `dsh/compaction.py` — pressure trigger, tool-result pruning, one durable summary, overflow recovery |
+| components | `dsh/harness.py` — c1…c8, artifacts, MCP proxies, subagents, runtime context |
+| bridge | `dsh/runtime.py` — harness → patch layers → mounted host → one turn |
+
+A turn is the same shape as upstream:
+
+```
+turn/start → claim → assemble prompt + tool schemas → agent/pre-step
+→ step/start → agent/request → system/message + user/message
+→ derive + freeze → stream → assistant/message
+→ tool/call → guarded pipeline → tool/result → step/end
+→ (another step if tools owe one) → agent/turn-stopping → turn/end
+```
+
+Durable facts land in `data/sessions/<chat>.jsonl` (one session per chat, resumed
+across turns), which is why `/api/chats/{id}/session` can replay exactly what the
+model saw. Compaction writes a `compaction/replace` marker instead of editing
+history, so the condensed prompt is reproducible. Set
+`WORKBENCH_LEGACY_LOOP=1` to fall back to the pre-harness loop.
+
+The **Harness → Composition** card shows the mounted tree (row → state →
+services); clicking a row prints its resolved config. `condense chat` runs
+`/compact` immediately.
+
+Tests (no network, scripted adapter):
+
+```sh
+python3 -m unittest discover -s tests -v
 ```
 
 ---
