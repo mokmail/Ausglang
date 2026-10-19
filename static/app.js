@@ -24,6 +24,19 @@ const state = {
 
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+/* Background news (job state, artifacts, server events) goes through notify(): the same
+   message is never shown twice within its cooldown. User-initiated actions use toast()
+   directly — those are a response to a click and should always appear. */
+const NOTIFY_SEEN = new Map();
+function notify(msg, kind = '', cooldown = 8000) {
+  const now = Date.now();
+  if (now - (NOTIFY_SEEN.get(msg) || 0) < cooldown) return false;
+  NOTIFY_SEEN.set(msg, now);
+  if (NOTIFY_SEEN.size > 60) NOTIFY_SEEN.clear();
+  toast(msg, kind);
+  return true;
+}
+
 function toast(msg, kind = '') {
   const el = document.createElement('div');
   el.className = 'toast ' + kind;
@@ -627,7 +640,7 @@ async function sendMessage(textOverride) {
           assistant.artifacts = assistant.artifacts || [];
           assistant.artifacts.push(data);
           aEl.querySelector('.bubble').appendChild(artCard(data, { inline: true }));
-          toast(`File written: ${data.name}`);
+          notify(`File written: ${data.name}`, '', 3000);
         } else if (ev === 'error') {
           toast(data.message, 'err');
           assistant.content += `\n\n**Error:** ${data.message}`;
@@ -955,7 +968,6 @@ async function switchModel(model) {
   try {
     setSwitching(true, model);
     await api('/api/server/start', { method: 'POST', body: payload });
-    toast(`Switching to ${model.split('/').pop()}…`);
     $('#jobBanner').hidden = false;
     await pollJob();
     setSwitching(false);
@@ -984,12 +996,18 @@ function renderJobBanner() {
     const key = `${j.state}|${j.model || ''}|${j.finished || 0}`;
     if (j.state === 'ready' && j.finished && key !== UI.state.jobAck) {
       UI.set({ jobAck: key });
-      const name = String(j.model || '').split('/').pop();
-      const pool = Number(j.pool || j.max_total_num_tokens || 0);
-      toast(`ready · ${name}${pool ? ` · pool ${pool.toLocaleString()} tok` : ''}`);
+      // only announce a load this tab actually watched; a page load is not news
+      if (jobWatched) {
+        const name = String(j.model || '').split('/').pop();
+        const pool = Number(j.pool || j.max_total_num_tokens || 0);
+        notify(`ready · ${name}${pool ? ` · pool ${pool.toLocaleString()} tok` : ''}`);
+      }
     }
+    jobWatched = false;
     return;
   }
+
+  if (active) jobWatched = true;
 
   bar.hidden = false;
   bar.classList.toggle('err', !!failed);
@@ -1017,6 +1035,7 @@ function renderJobBanner() {
 /* ----------------------------- state ----------------------------- */
 const JOB_ACTIVE = ['preparing', 'downloading', 'starting', 'stopping'];
 let jobErrDismissed = false;
+let jobWatched = false;   // did this tab see the load in progress?
 
 async function refreshState() {
   try {
@@ -1191,7 +1210,6 @@ async function startServer(model) {
   };
   try {
     await api('/api/server/start', { method: 'POST', body: payload });
-    toast(`Loading ${model}…`);
     pollJob();
   } catch (e) {
     toast(e.message, 'err');
@@ -1203,8 +1221,7 @@ async function pollJob() {
   while (guard++ < 400) {
     await refreshState();
     if (!JOB_ACTIVE.includes(state.job.state)) {
-      if (state.job.state === 'ready') { toast(`${state.job.model} ready`); loadModels(); }
-      if (state.job.state === 'failed') toast('Load failed — see the error in the model tab', 'err');
+      if (state.job.state === 'ready') loadModels();
       return;
     }
     await new Promise((r) => setTimeout(r, 1500));
