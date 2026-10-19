@@ -1,22 +1,17 @@
 # SGLang Workbench — docker compose
 #
-# Default (all operating systems): the workbench runs in a container and talks to
-# an SGLang server you run on the host:
+#   ./start-workbench.sh          # recommended: writes .env with this host's address, then up
+#   docker compose up -d --build  # plain compose, using whatever .env already says
 #
-#     # macOS:   ~/sglang/start-sglang.sh          (Metal / MLX)
-#     # Linux:   python -m sglang.launch_server --model-path ... --port 43440
-#     # Windows: run SGLang in WSL2 the same way
-#     docker compose up -d --build
-#     open http://localhost:8090
+# The workbench is GPU-agnostic: it speaks the OpenAI API to an SGLang server that
+# stays on the host (Metal on macOS, CUDA on Linux, WSL2 on Windows). The container
+# does not need a GPU, a driver or a special image.
 #
-# Linux + NVIDIA: bring SGLang up in its own GPU container instead:
+# Linux + NVIDIA: run SGLang in its own container instead:
+#   docker compose --profile gpu up -d     # engine on :30000, workbench auto-discovers it
 #
-#     MODEL=Qwen/Qwen3-1.7B docker compose --profile gpu up -d
-#     # then: UPSTREAM=http://sglang:30000 docker compose up -d workbench
-#     # (or set UPSTREAM in .env and run `--profile gpu up -d`)
-#
-# The optional GPU service requires the NVIDIA container toolkit and an
-# NVIDIA GPU; it is impossible on macOS/Windows, which is why it is a profile.
+# Everything is configurable through .env (copy .env.example). Nothing here is
+# specific to one machine: no hard-coded user paths, no fixed LAN address.
 
 name: sglang-workbench
 
@@ -26,44 +21,49 @@ services:
       context: .
       dockerfile: Dockerfile
     image: sglang-workbench:2.0.0
-    container_name: sglang-workbench
+    container_name: ${WORKBENCH_CONTAINER:-sglang-workbench}
     ports:
       - "${WORKBENCH_PORT:-8090}:8090"
     environment:
-      # Where the SGLang OpenAI API lives. host.docker.internal resolves on
-      # Docker Desktop (macOS/Windows) and, via extra_hosts below, on Linux.
+      # Where SGLang lives. If this address is wrong the app probes the usual
+      # suspects (host.docker.internal, the docker gateway, loopback) and reports
+      # what it found at /api/upstream — see the README troubleshooting table.
       UPSTREAM: ${UPSTREAM:-http://host.docker.internal:43440}
+      WORKBENCH_UPSTREAMS: ${WORKBENCH_UPSTREAMS:-}
+      WORKBENCH_LOADER_URL: ${WORKBENCH_LOADER_URL:-}
+      WORKBENCH_LOADER_TOKEN: ${WORKBENCH_LOADER_TOKEN:-}
       WORKBENCH_API_KEY: ${WORKBENCH_API_KEY:-}
       WORKBENCH_CORS_ORIGINS: ${WORKBENCH_CORS_ORIGINS:-*}
       WORKBENCH_DATA: /data
       WORKBENCH_ROOT: /app
-      HF_HOME: /hf-cache
-      # Empty => model loading is refused with a clear 501; the host owns the GPU.
       SGLANG_PYTHON: ${SGLANG_PYTHON:-}
-      # Optional host-side loader (loader_agent.py). When set, "Load model" in the
-      # UI works from inside the container: start/stop/job are forwarded to it.
-      WORKBENCH_LOADER_URL: ${WORKBENCH_LOADER_URL:-}
-      WORKBENCH_LOADER_TOKEN: ${WORKBENCH_LOADER_TOKEN:-}
+      HF_HOME: /hf-cache
       TZ: ${TZ:-UTC}
     volumes:
       - "${WORKBENCH_DATA_DIR:-./data}:/data"
-      # Mounted read-only so the "Downloaded" model list can be browsed from the
-      # container. Set HF_CACHE_DIR in .env if yours is elsewhere.
-      - "${HF_CACHE_DIR:-/Users/kmail/.cache/huggingface}:/hf-cache:ro"
+      # Read-only model cache, so "Downloaded" in the model browser shows what the
+      # host already has. Leave unset on machines without a HuggingFace cache.
+      - "${HF_CACHE_DIR:-./.hf-cache}:/hf-cache:ro"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    stop_grace_period: 20s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # Optional: SGLang itself in a container (Linux + NVIDIA only).
+  # Optional: SGLang in a container. Linux + NVIDIA only (Metal cannot run here).
   sglang:
-    image: lmsysorg/sglang:latest
-    container_name: sglang-server
+    image: ${SGLANG_IMAGE:-lmsysorg/sglang:latest}
+    container_name: ${SGLANG_CONTAINER:-sglang-server}
     profiles: ["gpu"]
     command:
       - python3
@@ -78,11 +78,11 @@ services:
       - --mem-fraction-static
       - ${MEM_FRACTION:-0.85}
     ports:
-      - "30000:30000"
+      - "${SGLANG_PORT:-30000}:30000"
     shm_size: "16gb"
     ipc: host
     volumes:
-      - "${HF_CACHE_DIR:-/Users/kmail/.cache/huggingface}:/root/.cache/huggingface"
+      - "${HF_CACHE_DIR:-./.hf-cache}:/root/.cache/huggingface"
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
     deploy:
@@ -93,4 +93,8 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

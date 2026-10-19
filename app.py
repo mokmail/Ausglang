@@ -57,7 +57,8 @@ MCP_PATH = DATA / "mcp_servers.json"
 MODEL_CACHE = DATA / "models_cache.json"
 SERVER_LOG = Path(os.environ.get("SGLANG_LOG", str(ROOT / "server.log")))
 
-UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:43440")
+UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:43440").rstrip("/")
+UPSTREAM_CHOSEN: dict[str, Any] = {"url": UPSTREAM, "at": 0.0, "all_failed_at": 0.0}
 PORT = int(os.environ.get("WORKBENCH_PORT", "8090"))
 # Path to the python that can run `-m sglang.launch_server`. Empty/absent means
 # model loading is disabled here (typical inside a container, where the GPU
@@ -503,11 +504,90 @@ def loader_call(method: str, path: str, payload: dict | None = None) -> Any:
     return r.json()
 
 
-def server_up() -> bool:
+def _docker_gateway() -> str | None:
+    """Default gateway inside the container — on plain Docker this is the host."""
     try:
-        return httpx.get(f"{UPSTREAM}/health", timeout=1.2).status_code == 200
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                fields = line.split()
+                if len(fields) > 2 and fields[1] == "00000000":
+                    ip = int(fields[2], 16)
+                    return ".".join(str((ip >> shift) & 0xFF) for shift in (0, 8, 16, 24))
+    except Exception:
+        pass
+    return None
+
+
+def upstream_candidates() -> list[str]:
+    """Every address the engine could plausibly live at, most explicit first.
+
+    `host.docker.internal` is the documented answer on Docker Desktop, but it resolves to
+    the VM's own loopback on some runners (Rancher, Colima), where the only route is the
+    host's LAN address. Trying a list is what makes `docker compose up` work unedited.
+    """
+    urls: list[str] = [UPSTREAM]
+    for extra in os.environ.get("WORKBENCH_UPSTREAMS", "").split(","):
+        if extra.strip():
+            urls.append(extra.strip().rstrip("/"))
+    # compose always defines the variable (possibly empty), so empty counts as unset
+    if not os.environ.get("WORKBENCH_UPSTREAMS", "").strip():
+        urls.append("http://host.docker.internal:43440")
+        gw = _docker_gateway()
+        if gw:
+            urls.append(f"http://{gw}:43440")
+        urls.append("http://127.0.0.1:43440")
+    seen: set[str] = set()
+    return [u for u in urls if not (u in seen or seen.add(u))]
+
+
+def _healthy(url: str, timeout: float = 1.5) -> bool:
+    try:
+        return httpx.get(f"{url}/health", timeout=timeout).status_code == 200
     except Exception:
         return False
+
+
+def resolve_upstream(ttl: float = 20.0, force: bool = False) -> str:
+    """Pick the first reachable candidate and remember it briefly."""
+    global UPSTREAM
+    now = time.time()
+    if not force:
+        if _healthy(UPSTREAM_CHOSEN["url"], 0.8) and now - UPSTREAM_CHOSEN["at"] < ttl * 3:
+            return UPSTREAM_CHOSEN["url"]
+        if now - UPSTREAM_CHOSEN["at"] < ttl:
+            return UPSTREAM_CHOSEN["url"]
+    for url in upstream_candidates():
+        if _healthy(url):
+            if url != UPSTREAM_CHOSEN["url"]:
+                print(f"[upstream] using {url}", flush=True)
+            UPSTREAM = UPSTREAM_CHOSEN["url"] = url
+            UPSTREAM_CHOSEN["at"] = now
+            return url
+    UPSTREAM_CHOSEN["at"] = now
+    return UPSTREAM_CHOSEN["url"]
+
+
+def resolve_loader(ttl: float = 60.0, force: bool = False) -> str:
+    """When no loader URL is configured, look for one next to the engine."""
+    global LOADER_URL
+    if LOADER_URL and not force:
+        return LOADER_URL
+    base = resolve_upstream()
+    host = base.split("//", 1)[-1].rsplit(":", 1)[0]
+    for candidate in (f"http://{host}:43441", "http://host.docker.internal:43441"):
+        try:
+            if httpx.get(f"{candidate}/healthz", timeout=1.5).status_code == 200:
+                if candidate != LOADER_URL:
+                    print(f"[loader] using {candidate}", flush=True)
+                LOADER_URL = candidate
+                return candidate
+        except Exception:
+            continue
+    return LOADER_URL
+
+
+def server_up() -> bool:
+    return _healthy(resolve_upstream(), 1.2)
 
 
 _INFO_CACHE: dict[str, Any] = {"t": 0.0, "v": {}}
@@ -1392,6 +1472,33 @@ async def api_model_detail(id: str = Query(...)) -> dict[str, Any]:
 def api_server_start(req: ServerStartRequest = Body(...)) -> dict[str, Any]:
     payload = req.model_dump()
     return start_load(payload)
+
+
+@app.get("/api/upstream", tags=["system"], summary="Where the engine is and why it is (not) reachable")
+def api_upstream() -> dict[str, Any]:
+    """One call that answers "is the container talking to the right host?"."""
+    probe = []
+    for url in upstream_candidates():
+        probe.append({"url": url, "ok": _healthy(url, 1.2)})
+    chosen = resolve_upstream()
+    loader_probe = []
+    host = chosen.split("//", 1)[-1].rsplit(":", 1)[0]
+    for url in (f"http://{host}:43441", "http://host.docker.internal:43441"):
+        try:
+            ok = httpx.get(f"{url}/healthz", timeout=1.2).status_code == 200
+        except Exception:
+            ok = False
+        loader_probe.append({"url": url, "ok": ok})
+    return {
+        "chosen": chosen,
+        "reachable": _healthy(chosen, 1.2),
+        "candidates": probe,
+        "loader": {"configured": bool(os.environ.get("WORKBENCH_LOADER_URL")),
+                   "resolved": LOADER_URL or None,
+                   "candidates": loader_probe},
+        "hint": ("set UPSTREAM in .env to the address of the machine running SGLang"
+                 if not any(c["ok"] for c in probe) else None),
+    }
 
 
 @app.get("/api/memory", tags=["system"], summary="Memory picture and a model sizing plan")
@@ -2299,6 +2406,12 @@ def healthz() -> dict[str, Any]:
     return {"ok": True, "server": server_info(), "job": JOB.snapshot()}
 
 
+def _startup_discovery() -> None:
+    url = resolve_upstream(force=True)
+    loader = resolve_loader(force=True)
+    print(f"[startup] upstream={url} loader={loader or '(none)'}", flush=True)
+
+
 def main() -> None:
     global UPSTREAM, PORT
     ap = argparse.ArgumentParser()
@@ -2313,6 +2426,7 @@ def main() -> None:
     if not SETTINGS_PATH.exists():
         save_settings(DEFAULT_SETTINGS)
     print(f"SGLang Workbench v2  http://{a.host}:{a.port}  -> upstream {UPSTREAM}")
+    _startup_discovery()
     import uvicorn
 
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")

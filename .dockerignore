@@ -5,3 +5,15 @@ data/
 *.log
 .pytest_cache/
 .DS_Store
+.env
+.env.*
+!.env.example
+.git/
+.github/
+*.db
+*.db-wal
+*.db-shm
+artifacts/
+venv/
+.venv/
+node_modules/

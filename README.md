@@ -9,6 +9,50 @@ on macOS, Windows and Linux while the Metal/CUDA stack stays where it works.
 
 ---
 
+## Docker Compose
+
+The image is GPU-agnostic: it talks to SGLang over the OpenAI API, so Metal/CUDA stays on the
+host and the same container runs on macOS, Windows (WSL2) and Linux.
+
+```bash
+./start-workbench.sh          # writes .env for this host, starts engine + container
+open http://localhost:8090
+```
+
+Or, once `.env` exists (copy `.env.example` to make one by hand):
+
+```bash
+docker compose up -d --build
+docker compose logs -f workbench
+docker compose down
+```
+
+**What the script does that plain compose cannot**: the container must reach the *host*, and
+`host.docker.internal` resolves to the VM's own loopback on Rancher/Colima — the engine
+connection is refused. The script detects the host's LAN address, writes `UPSTREAM` and
+`WORKBENCH_LOADER_URL` into `.env`, and starts the engine when it is not already running.
+
+| I want to… | command |
+|---|---|
+| start everything | `./start-workbench.sh` |
+| start the container only (engine elsewhere) | `./start-workbench.sh --no-engine` |
+| stop | `./start-workbench.sh down` |
+| use a different port | `WORKBENCH_PORT=9000 ./start-workbench.sh` |
+| SGLang in its own container (Linux + NVIDIA) | `docker compose --profile gpu up -d` |
+| see what the container can reach | `curl -s localhost:8090/api/upstream` |
+
+`/api/upstream` is the diagnostic to reach for when the UI says the server is down: it lists
+every address probed, which one answered, whether the loader was found, and a hint when none
+of them worked.
+
+State lives in `./data` (bind mount, `WORKBENCH_DATA_DIR`): the SQLite database, artifacts and
+settings. Copy that directory to back up or move the workspace; it is the only thing the
+container writes. `HF_CACHE_DIR` is mounted read-only so the model browser can list models the
+host already downloaded.
+
+Images are built from source on start (`--build`), so a `git pull` followed by
+`./start-workbench.sh` always runs the code you have.
+
 ## Quick start
 
 ```bash
