@@ -53,7 +53,7 @@ fi
 cd "$HERE"
 UPSTREAM="http://$IP:$PORT_ENGINE" \
 WORKBENCH_LOADER_URL="http://$IP:$PORT_LOADER" \
-  docker compose up -d "$@" 2>&1 | tail -2
+  docker compose up -d --build "$@" 2>&1 | tail -2   # --build: never serve a stale image
 
 for _ in $(seq 1 40); do
   [ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_APP/healthz")" = "200" ] && break
