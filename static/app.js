@@ -54,6 +54,7 @@ const UI_DEFAULTS = {
   density: 'comfortable', sideW: 288, panelW: 410, measure: 830,
   modelSource: 'cache', modelTask: '', modelQuery: '',
   harness: null, persona: null, drafts: {}, scroll: {}, filesTab: 'chats',
+  jobAck: null,
 };
 
 const UI = {
@@ -972,18 +973,27 @@ function renderJobBanner() {
   if (!bar) return;
   const j = state.job || {};
   const active = JOB_ACTIVE.includes(j.state);
-  const justFinished = j.state === 'ready' && jobDoneUntil && Date.now() < jobDoneUntil;
   const failed = j.state === 'failed' && !jobErrDismissed;
 
-  if (!active && !justFinished && !failed) {
+  // A finished load is history, not a notification. The loader keeps reporting "ready"
+  // forever, so acknowledging by (state|model|finished) is what stops it re-appearing on
+  // every poll, every page load and every refresh of another tab.
+  if (!active && !failed) {
     bar.hidden = true;
     bar.classList.remove('err', 'done');
+    const key = `${j.state}|${j.model || ''}|${j.finished || 0}`;
+    if (j.state === 'ready' && j.finished && key !== UI.state.jobAck) {
+      UI.set({ jobAck: key });
+      const name = String(j.model || '').split('/').pop();
+      const pool = Number(j.pool || j.max_total_num_tokens || 0);
+      toast(`ready · ${name}${pool ? ` · pool ${pool.toLocaleString()} tok` : ''}`);
+    }
     return;
   }
 
   bar.hidden = false;
   bar.classList.toggle('err', !!failed);
-  bar.classList.toggle('done', !!justFinished);
+  bar.classList.remove('done');
   $('#jbState').textContent = failed ? 'failed' : j.state;
   $('#jbModel').textContent = j.model ? j.model.split('/').pop() : '';
   $('#jbCancel').hidden = !active;
@@ -991,7 +1001,7 @@ function renderJobBanner() {
   const pct = Number(j.progress || 0);
   const fill = $('#jbFill');
   // download progress is real; starting/stopping has none — show an indeterminate sweep
-  fill.classList.toggle('indet', active && !['downloading'].includes(j.state));
+  fill.classList.toggle('indet', active && j.state !== 'downloading');
   fill.style.width = `${active && j.state === 'downloading' ? pct : Math.max(6, pct)}%`;
 
   const parts = [];
@@ -1006,7 +1016,6 @@ function renderJobBanner() {
 
 /* ----------------------------- state ----------------------------- */
 const JOB_ACTIVE = ['preparing', 'downloading', 'starting', 'stopping'];
-let jobDoneUntil = 0;      // keep the "ready" banner visible briefly, then fade
 let jobErrDismissed = false;
 
 async function refreshState() {
@@ -1042,7 +1051,6 @@ async function refreshState() {
       $('#jobChip').className = 'chip busy';
       $('#jobChip').textContent = `${state.job.state}${pct}`;
     }
-    if (state.job.state === 'ready' && !jobDoneUntil) jobDoneUntil = Date.now() + 4000;
     if (JOB_ACTIVE.includes(state.job.state)) jobErrDismissed = false;
     // rendering problems are UI problems: they must not flip the connection pill
     for (const name of ['renderServerCard', 'renderJobBanner', 'applySwitchingUI', 'applySettingsToForm']) {
@@ -1957,9 +1965,7 @@ async function boot() {
       const j = await api('/api/server/job');
       const changed = j.state !== state.job.state || j.progress !== state.job.progress;
       state.job = j;
-      if (j.state === 'ready' && !jobDoneUntil) jobDoneUntil = Date.now() + 4000;
       if (JOB_ACTIVE.includes(j.state)) jobErrDismissed = false;
-      if (Date.now() > jobDoneUntil && !JOB_ACTIVE.includes(j.state)) jobDoneUntil = 0;
       renderJobBanner();
       if (changed) {
         renderJobBanner();
