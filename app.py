@@ -1484,6 +1484,35 @@ def api_chat_patch(chat_id: str, req: ChatPatch = Body(...)) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.delete("/api/chats", tags=["chats"], summary="Delete every conversation")
+def api_chats_clear(confirm: str = "") -> dict[str, Any]:
+    """Wipe the chat history: every conversation, its messages and its artifacts.
+
+    Requires ``?confirm=all`` so a stray request (or a mistyped curl) cannot destroy the
+    workspace. Settings, memory entries, prompts, personas, harnesses and MCP servers are
+    deliberately kept — this is a history reset, not a factory reset.
+    """
+    if confirm != "all":
+        raise HTTPException(428, "refusing to delete every chat without confirm=all")
+    with db() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM chats").fetchall()]
+        messages = conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
+        artifacts = conn.execute("SELECT COUNT(*) c FROM artifacts").fetchone()["c"]
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM artifacts")
+        conn.execute("DELETE FROM chats")
+    files = 0
+    for cid in ids:
+        d = chat_artifact_dir(cid)
+        if d.exists():
+            for f in d.rglob("*"):
+                if f.is_file():
+                    files += 1
+            shutil.rmtree(d, ignore_errors=True)
+    return {"deleted_chats": len(ids), "deleted_messages": messages,
+            "deleted_artifacts": artifacts, "files_removed": files}
+
+
 @app.delete("/api/chats/{chat_id}", tags=["chats"], summary="Rename, pin or delete a conversation")
 def api_chat_delete(chat_id: str) -> dict[str, Any]:
     with db() as conn:

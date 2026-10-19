@@ -532,3 +532,8 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
 /* the settings control lives in the topbar: give it a hint of emphasis */
 #openPanel{order:-1;margin-right:2px}
 #openPanel.on{color:var(--accent)}
+
+/* chat list header: search + clear-history */
+.search-row{display:flex;gap:7px;align-items:center;padding:0 14px 10px}
+.search-row .search{flex:1;margin:0;padding:0}
+.icon-btn.danger:hover{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%, var(--line))}

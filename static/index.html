@@ -25,10 +25,15 @@
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg> New chat
     </button>
 
-    <div class="search">
-      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
-      <input id="chatSearch" placeholder="Search chats" autocomplete="off">
-      <kbd>⌘K</kbd>
+    <div class="search-row">
+      <div class="search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="chatSearch" placeholder="Search chats" autocomplete="off">
+        <kbd>⌘K</kbd>
+      </div>
+      <button class="icon-btn danger" id="clearHistory" title="Clear all chat history">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
+      </button>
     </div>
 
     <div class="chats" id="chatList"></div>

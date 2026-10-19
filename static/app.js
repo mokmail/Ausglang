@@ -291,6 +291,30 @@ function md(src) {
   });
 }
 
+
+/* --------------------------- clear history --------------------------- */
+async function clearHistory() {
+  const n = state.chats.length;
+  if (!n) return toast('No chats to clear');
+  const ok = confirm(
+    `Delete all ${n} conversation${n === 1 ? '' : 's'}?\n\n` +
+    'Messages and generated files go with them. Settings, memory, prompts and personas are kept.'
+  );
+  if (!ok) return;
+  try {
+    const r = await api('/api/chats?confirm=all', { method: 'DELETE' });
+    UI.set({ chatId: null, drafts: {}, scroll: {} });
+    state.chats = [];
+    state.messages = [];
+    state.chatId = null;
+    renderChats();
+    await newChat();
+    notify(`cleared ${r.deleted_chats} chats · ${r.deleted_messages} messages`);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
 /* ------------------------------ chats ------------------------------ */
 function renderChats() {
   const q = $('#chatSearch').value.trim().toLowerCase();
@@ -1578,6 +1602,7 @@ window.addEventListener('message', (e) => {
 function paletteItems() {
   const cmds = [
     { label: 'New chat', kind: 'action', run: newChat },
+    { label: 'Clear all chat history', kind: 'action', run: clearHistory },
     { label: 'Open model manager', kind: 'action', run: () => openPanel('model') },
     { label: 'Open settings', kind: 'action', run: () => openPanel('params') },
     { label: 'Open memory', kind: 'action', run: () => openPanel('memory') },
@@ -1661,6 +1686,7 @@ async function toggleTheme() {
 
 function bind() {
   $('#newChat').onclick = newChat;
+  $('#clearHistory').onclick = clearHistory;
   $('#chatSearch').oninput = renderChats;
   $('#sendBtn').onclick = () => (state.streaming ? state.abort?.abort() : sendMessage());
   $('#input').addEventListener('input', autosize);
