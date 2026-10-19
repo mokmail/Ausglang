@@ -528,3 +528,7 @@ html[data-theme="light"] .body pre{background:#0f1512;border-color:#1b2521}
 .composer-tools .send{width:34px;height:34px;padding:0;display:grid;place-items:center;border-radius:10px}
 .composer-tools .send svg{width:17px;height:17px}
 #input{display:block;width:100%}
+
+/* the settings control lives in the topbar: give it a hint of emphasis */
+#openPanel{order:-1;margin-right:2px}
+#openPanel.on{color:var(--accent)}

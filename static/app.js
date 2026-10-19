@@ -141,6 +141,8 @@ function applyLayout() {
   app.classList.toggle('with-panel', !!s.panel);
   $('#panel').classList.toggle('open', !!s.panel);
   $('#panelResize').hidden = !s.panel;
+  const openBtn = $('#openPanel');
+  if (openBtn) openBtn.classList.toggle('on', !!s.panel);
   const scrimEl = $('#scrim');
   if (scrimEl) scrimEl.hidden = !s.panel;
   $('#sideResize').hidden = !s.sidebar;
@@ -1699,7 +1701,7 @@ function bind() {
   $('#closeLogs').onclick = () => $('#logsModal').classList.remove('open');
   $('#refreshLogs').onclick = showLogs;
   $('#closeStats').onclick = () => $('#statsModal').classList.remove('open');
-  $('#openPanel').onclick = () => openPanel('model');
+  $('#openPanel').onclick = () => openPanel(UI.state.tab || 'model');
   $('#paletteBtn').onclick = openPalette;
   $('#closePanel').onclick = () => {
     $('#panel').classList.remove('open');
