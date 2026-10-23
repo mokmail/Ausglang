@@ -5,3 +5,13 @@ httpx>=0.27,<1.0
 huggingface_hub>=0.30
 pypdf>=5.0
 python-multipart>=0.0.9
+# memory.py sizes a model against real host RAM (used by /api/memory/plan)
+psutil>=5.9
+# PDF extraction MCP server (pdfmcp/)
+fastmcp>=4.0
+pypdfium2>=4.30
+fonttools>=4.50
+# Docling gives the best structure (heading hierarchy, tables, page
+# provenance) but pulls in torch. Optional: without it pdfmcp falls back to
+# the pypdf + pypdfium2 engine, which needs no ML and no model downloads.
+# docling>=2.20

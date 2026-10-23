@@ -341,6 +341,139 @@ POST   /api/lessons/reflect               extract a lesson from the last exchang
 
 ---
 
+## PDF extraction (`pdfmcp`)
+
+An MCP server that turns a PDF into **structured markdown plus a parallel
+manifest**, and extracts the images into their own directory.
+
+```bash
+# register it with the running workbench
+curl -X POST localhost:8090/api/mcp/servers -H 'Content-Type: application/json' \
+  -d '{"name":"pdf","command":"python","args":["/abs/path/to/pdfmcp_server.py"]}'
+curl -X POST localhost:8090/api/mcp/servers/pdf/connect
+```
+
+The server is registered automatically on startup when `pdfmcp/` is present.
+
+### What you see in the composer
+
+The input area carries a row of chips, one per registered MCP server, so the
+answer to "what can this actually do?" is visible where you write the prompt:
+
+```
+● pdf 5 tools   ● demo 4 tools   manage
+```
+
+Click a chip to expand that server's tools with a one-line description and the
+parameter signature (required parameters in plain brackets, optional ones in
+square brackets):
+
+```
+extract_pdf   Extract text and images from a PDF into structured markdown + manifest.
+              (pdf_path, [out_dir], [backend], [do_ocr], [extract_images], [name])
+```
+
+A green dot means connected, amber means registered but not connected, and a
+dimmed chip means the server is switched off. The `tools N` button shows how
+many tools are available; hovering it lists every server and tool, and says
+plainly whether they are currently being sent to the model.
+
+### What it produces
+
+```
+<out_dir>/<name>/
+  document.md     structured markdown: headings, paragraphs, lists, tables
+  manifest.json   the machine-readable twin of the markdown
+  images/         one file per extracted image
+```
+
+`document.md` carries a `<!-- page: N -->` marker before each page and an
+`<!-- id: t0042 | page: 7 | topic: 3.1 PDF backends -->` anchor before every
+block, so any passage in the markdown can be traced back to the manifest.
+
+`manifest.json` is the parallel index:
+
+```jsonc
+{
+  "source": { "name": "paper.pdf", "sha256": "…", "page_count": 9 },
+  "backend": "docling",
+  "counts": { "text_blocks": 725, "images": 5, "topics": 25, "words": 7646 },
+  "topics": [ { "topic": "3.1 PDF backends", "blocks": 20 } ],
+  "texts": [
+    {
+      "id": "t0042",
+      "page": 7,                    // 1-based source page
+      "kind": "paragraph",
+      "topic": "PDF backends",      // the section it belongs to
+      "topic_path": ["Processing pipeline", "PDF backends"],
+      "level": null,
+      "bbox": [108.9, 719.5, 504.2, 706.1],
+      "order": 42,                  // reading order
+      "text": "…",
+      "meta": { "undecodable": 0 }  // glyphs that could not be decoded
+    }
+  ],
+  "images": [
+    {
+      "id": "i0002",
+      "page": 3,                    // the page it came from
+      "file": "i0002_p003.png",
+      "file_relative": "images/i0002_p003.png",
+      "width_px": 785, "height_px": 276,
+      "bytes": 33545,
+      "bbox": [109.75, 719.46, 502.24, 581.74],
+      "topic": "Table Structure Recognition",
+      "meta": { "dpi": 144, "caption": "…" }
+    }
+  ]
+}
+```
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `extract_pdf` | full extraction: markdown + manifest + images |
+| `extract_images` | images only, with the page each came from |
+| `read_manifest` | read back and summarise a manifest |
+| `list_extractions` | what has been extracted so far |
+| `pdf_info` | metadata, page count, outline — writes nothing |
+
+### Engines
+
+| Backend | Structure | Needs |
+|---|---|---|
+| `docling` | best: heading hierarchy, tables, reading order, page provenance | `docling` (pulls torch) |
+| `fallback` | text layout, PDF outline, embedded images | `pypdf` + `pypdfium2` only |
+
+`auto` (the default) uses Docling when it is installed and falls back to
+pypdf/pdfium otherwise — the fallback needs no ML and no model downloads, so
+the server still works in a slim container. `fonttools` is required for
+correct text decoding on PDFs with subsetted CFF fonts; without it those
+documents come out as mojibake.
+
+To enable the Docling backend, uncomment it in `requirements.txt` and rebuild.
+
+### Transports
+
+```bash
+python pdfmcp_server.py             # stdio — what the workbench speaks
+python pdfmcp_server.py --http      # streamable-http on 0.0.0.0:8500/mcp
+```
+
+The workbench talks to the server over stdio (it spawns it as a child
+process), so no extra container is needed. For clients that expect an HTTP
+MCP endpoint, the compose file ships an optional service:
+
+```bash
+docker compose --profile pdf up -d   # then: http://localhost:8510/mcp
+```
+
+Extractions are written to `PDFMCP_OUT` (default `data/pdf-extracts`), which
+in the container is the `./data` bind mount — so they survive a rebuild.
+
+---
+
 ## DeepSeek Harness (the loop that runs your chats)
 
 The chat loop is a port of [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
@@ -374,8 +507,7 @@ turn/start → claim → assemble prompt + tool schemas → agent/pre-step
 Durable facts land in `data/sessions/<chat>.jsonl` (one session per chat, resumed
 across turns), which is why `/api/chats/{id}/session` can replay exactly what the
 model saw. Compaction writes a `compaction/replace` marker instead of editing
-history, so the condensed prompt is reproducible. Set
-`WORKBENCH_LEGACY_LOOP=1` to fall back to the pre-harness loop.
+history, so the condensed prompt is reproducible.
 
 The **Harness → Composition** card shows the mounted tree (row → state →
 services); clicking a row prints its resolved config. `condense chat` runs
@@ -433,7 +565,7 @@ token from the model's own `config.json`, and current available RAM:
 
 ```
 GET /memory?model=Qwen/Qwen3-1.7B          # loader (host numbers)
-GET /api/memory                            # workbench, proxied to the loader
+GET /api/memory/plan                       # workbench, proxied to the loader
 ```
 
 The loader answers with `scope: "host"` (available RAM, swap, pressure, per-process RSS), the
@@ -513,6 +645,7 @@ Deep links: `/?chat=<id>` opens a specific chat, `/?menu=models` opens the model
 ```
 workbench/
   app.py               FastAPI backend (API + SSE + MCP client + job runner)
+  loader_core.py       download/spawn/OOM-retry loop shared by app.py and the loader
   static/              index.html, app.css, app.js (no build step)
   Dockerfile           portable image (python:3.11-slim, non-root)
   docker-compose.yml   workbench + optional GPU sglang profile
@@ -521,4 +654,9 @@ workbench/
   run-loader.sh        launcher for the loader
   verify-workbench.sh  end-to-end ad-hoc checks
   mcp_demo_server.py   tiny stdio MCP server used by the tests
+  pdfmcp/              PDF extraction engine + manifest writer + MCP server
+  pdfmcp_server.py     launcher for the PDF MCP server (stdio or --http)
+  tests/
+    test_dsh.py
+    test_pdfmcp.py
 ```

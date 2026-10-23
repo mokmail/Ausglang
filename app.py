@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import functools
 import io
 import json
 import os
@@ -33,21 +35,25 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 import harness2_lite as h2
 from dsh import runtime as dsh_runtime
+from dsh.harness import TOOL_PROTOCOL
 from dsh.llm import OpenAICompatibleAdapter
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from loader_core import (CTX_CEILING, Job, log_tail, run as _run, run_load,
+                         stop_engine)
 
 ROOT = Path(os.environ.get("WORKBENCH_ROOT", "/Users/kmail/sglang"))
 HERE = Path(__file__).resolve().parent
@@ -59,12 +65,10 @@ SETTINGS_PATH = DATA / "settings.json"
 MCP_PATH = DATA / "mcp_servers.json"
 MODEL_CACHE = DATA / "models_cache.json"
 DSH_SESSIONS = DATA / "sessions"
-LEGACY_LOOP = os.environ.get("WORKBENCH_LEGACY_LOOP", "").strip().lower() in (
-    "1", "true", "yes", "on")
 SERVER_LOG = Path(os.environ.get("SGLANG_LOG", str(ROOT / "server.log")))
 
 UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:43440").rstrip("/")
-UPSTREAM_CHOSEN: dict[str, Any] = {"url": UPSTREAM, "at": 0.0, "all_failed_at": 0.0}
+UPSTREAM_CHOSEN: dict[str, Any] = {"url": UPSTREAM, "at": 0.0}
 PORT = int(os.environ.get("WORKBENCH_PORT", "8090"))
 # Path to the python that can run `-m sglang.launch_server`. Empty/absent means
 # model loading is disabled here (typical inside a container, where the GPU
@@ -78,7 +82,6 @@ ARTIFACTS_DIR = Path(os.environ.get("WORKBENCH_ARTIFACTS", str(DATA / "artifacts
 LOADER_URL = os.environ.get("WORKBENCH_LOADER_URL", "").rstrip("/")
 LOADER_TOKEN = os.environ.get("WORKBENCH_LOADER_TOKEN", "")
 API_VERSION = "2.0.0"
-CTX_CEILING = 12288   # tested: 12k prefill passes, 16k Metal-OOMs on this box
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "model": "Qwen/Qwen3-0.6B",
@@ -119,34 +122,112 @@ def ensure_demo_mcp() -> None:
     like /Users/x/sglang/.venv/bin/python is meaningless inside the image. Repair
     it instead of shipping a dead example.
     """
-    if not (HERE / "mcp_demo_server.py").exists():
+    _ensure_bundled_mcp("demo", HERE / "mcp_demo_server.py")
+
+
+def ensure_pdf_mcp() -> None:
+    """Register the bundled PDF extraction MCP server.
+
+    Same reasoning as ensure_demo_mcp: the registry is shared between host
+    and container deployments, so a host path is meaningless inside the
+    image. Register it with the interpreter that is running *this* process.
+    """
+    _ensure_bundled_mcp("pdf", HERE / "pdfmcp_server.py")
+
+
+def _ensure_bundled_mcp(name: str, script: Path) -> None:
+    """Make a bundled server exist, enabled, and pointed at a real script.
+
+    ``bundled`` marks the entry as one this app ships: it is repaired on
+    every start (so a stale host path cannot leave it dead) and the UI shows
+    it as built in rather than something the user added.
+    """
+    if not script.exists():
         return
     servers = load_mcp()
-    want_cmd, want_args = sys.executable, [str(HERE / "mcp_demo_server.py")]
+    # an absolute path to the launcher: the registry is shared between host
+    # and container, so a relative command would resolve against the wrong
+    # working directory.
+    want_cmd, want_args = sys.executable, [str(script)]
     changed = False
-    demo = next((x for x in servers if x.get("name") == "demo"), None)
-    if demo is None:
-        servers.append({"name": "demo", "command": want_cmd, "args": want_args, "env": {}, "enabled": True})
+    entry = next((x for x in servers if x.get("name") == name), None)
+    if entry is None:
+        servers.append({"name": name, "command": want_cmd, "args": want_args,
+                        "env": {}, "enabled": True, "bundled": True})
         changed = True
     else:
-        cmd_ok = Path(demo.get("command") or "").exists()
-        args_ok = all(Path(a).exists() for a in (demo.get("args") or []) if a.endswith(".py"))
+        cmd_ok = Path(entry.get("command") or "").exists()
+        args_ok = all(Path(a).exists() for a in (entry.get("args") or []) if a.endswith(".py"))
         if not (cmd_ok and args_ok):
-            demo["command"], demo["args"] = want_cmd, want_args
+            entry["command"], entry["args"] = want_cmd, want_args
+            changed = True
+        if not entry.get("bundled"):
+            entry["bundled"] = True
+            changed = True
+        if (entry.get("enabled") is False
+                and not entry.get("disabled_by_user")):
+            # a bundled server is on by default. It stays off only when the
+            # user turned it off on purpose (the toggle records that), so a
+            # stale or half-written registry cannot leave it disabled.
+            entry["enabled"] = True
             changed = True
     if changed:
         save_mcp(servers)
 
 
-def db() -> sqlite3.Connection:
+_DB_POOL: list[sqlite3.Connection] = []
+_DB_LOCK = threading.Lock()
+_DB_MAX_IDLE = 8      # open handles kept for reuse; more are closed on return
+
+
+def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # `timeout=30` already installs a 30 s busy handler; a busy_timeout pragma
+    # here would only shorten it. NORMAL is the fast WAL pairing.
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+
+def _acquire() -> sqlite3.Connection:
+    with _DB_LOCK:
+        if _DB_POOL:
+            return _DB_POOL.pop()
+    return _connect()
+
+
+def _release(conn: sqlite3.Connection) -> None:
+    with _DB_LOCK:
+        if len(_DB_POOL) < _DB_MAX_IDLE:
+            _DB_POOL.append(conn)
+            return
+    conn.close()
+
+
+@contextlib.contextmanager
+def db() -> Iterator[sqlite3.Connection]:
+    """One transaction against the workspace database.
+
+    Commits on success and rolls back on any exception, so a handler that dies
+    halfway through a multi-statement write cannot leave half a state behind.
+    Connections are pooled rather than opened per request: SQLite open/close
+    around WAL costs a checkpoint, and the handle count stays bounded. WAL
+    itself is a property of the database file and is set once in `init_db`.
+    """
+    conn = _acquire()
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        _release(conn)
 
 
 def init_db() -> None:
     with db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")   # persistent: set once per database file
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS chats (
@@ -206,6 +287,18 @@ def init_db() -> None:
             )
 
 
+def _rows(table: str, order: str = "created DESC") -> list[dict[str, Any]]:
+    """Every row of a small table, newest first (table names are literals)."""
+    with db() as conn:
+        return [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY {order}")]
+
+
+def _delete_row(table: str, key: str, value: str) -> dict[str, Any]:
+    with db() as conn:
+        conn.execute(f"DELETE FROM {table} WHERE {key}=?", (value,))
+    return {"deleted": value}
+
+
 def load_settings() -> dict[str, Any]:
     s = dict(DEFAULT_SETTINGS)
     if SETTINGS_PATH.exists():
@@ -249,15 +342,31 @@ CURATED = [
 HF_CACHE = HF_CACHE_DIR / "hub"
 
 
+_CACHED_MODELS: dict[str, Any] = {"key": None, "v": {}}
+
+
 def cached_models() -> dict[str, float]:
-    out: dict[str, float] = {}
+    """Model sizes already on disk, keyed by repo id.
+
+    `rglob` + `stat` over a whole cache of multi-GB models is slow enough to
+    notice on every `/api/models`; the answer only changes when the hub
+    directory does, so it is memoized on that directory's mtime.
+    """
     if not HF_CACHE.exists():
-        return out
+        return {}
+    try:
+        key = (str(HF_CACHE), HF_CACHE.stat().st_mtime, len(os.listdir(HF_CACHE)))
+    except OSError:
+        key = None
+    if key is not None and _CACHED_MODELS["key"] == key:
+        return dict(_CACHED_MODELS["v"])
+    out: dict[str, float] = {}
     for d in HF_CACHE.glob("models--*"):
         name = d.name.replace("models--", "").replace("--", "/")
         size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
         out[name] = round(size / 2**30, 2)
-    return out
+    _CACHED_MODELS.update(key=key, v=out)
+    return dict(out)
 
 
 def _cache_get(key: str, ttl: float = 600.0) -> Any | None:
@@ -453,6 +562,40 @@ def mcp_client(name: str) -> McpStdioClient:
     return client
 
 
+def mcp_status() -> list[dict[str, Any]]:
+    """Describe every registered MCP server, with the tools it offers.
+
+    The composer shows this, so the answer to "what can this actually do?"
+    is visible where the user writes the prompt. It reads only the clients
+    that are already connected, so it never starts a server as a side effect
+    of a status poll.
+    """
+    out: list[dict[str, Any]] = []
+    for cfg in load_mcp():
+        name = cfg.get("name") or ""
+        client = MCP_CLIENTS.get(name)
+        connected = bool(client and client.tools)
+        tools: list[dict[str, Any]] = []
+        if connected and cfg.get("enabled") is not False:
+            for t in client.tools:
+                schema = t.get("inputSchema") or {}
+                params = list((schema.get("properties") or {}).keys())
+                tools.append({
+                    "name": t.get("name") or "?",
+                    "description": (t.get("description") or "").strip(),
+                    "params": params,
+                    "required": list(schema.get("required") or []),
+                })
+        out.append({
+            "name": name,
+            "enabled": cfg.get("enabled", True),
+            "bundled": bool(cfg.get("bundled")),
+            "connected": connected,
+            "tools": tools,
+        })
+    return out
+
+
 def all_mcp_tools() -> list[dict[str, Any]]:
     out = []
     for cfg in load_mcp():
@@ -470,38 +613,9 @@ def all_mcp_tools() -> list[dict[str, Any]]:
 # server lifecycle (background job with progress)
 # --------------------------------------------------------------------------- #
 
-
-class LoadJob:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.state: dict[str, Any] = {
-            "state": "idle", "model": None, "progress": 0.0,
-            "message": "", "error": None, "started": None, "finished": None,
-        }
-        self.proc: subprocess.Popen | None = None
-        self.thread: threading.Thread | None = None
-        self.cancel = threading.Event()
-
-    def snapshot(self) -> dict[str, Any]:
-        with self.lock:
-            return dict(self.state)
-
-    def _set(self, **kw: Any) -> None:
-        with self.lock:
-            self.state.update(kw)
-
-
-JOB = LoadJob()
-
-
-def _run(cmd: list[str], timeout: float = 20.0) -> subprocess.CompletedProcess | None:
-    """subprocess.run that survives slim images with no pgrep/ps/pkill."""
-    if not shutil.which(cmd[0]):
-        return None
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except Exception:
-        return None
+# Job, subprocess and download helpers live in loader_core so the host-side
+# loader agent (loader_agent.py) runs exactly the same code, not a copy.
+JOB = Job()
 
 
 def loader_call(method: str, path: str, payload: dict | None = None) -> Any:
@@ -563,17 +677,15 @@ def resolve_upstream(ttl: float = 20.0, force: bool = False) -> str:
     """Pick the first reachable candidate and remember it briefly."""
     global UPSTREAM
     now = time.time()
-    if not force:
-        if _healthy(UPSTREAM_CHOSEN["url"], 0.8) and now - UPSTREAM_CHOSEN["at"] < ttl * 3:
-            return UPSTREAM_CHOSEN["url"]
-        if now - UPSTREAM_CHOSEN["at"] < ttl:
-            return UPSTREAM_CHOSEN["url"]
+    if not force and now - UPSTREAM_CHOSEN["at"] < ttl:
+        return UPSTREAM_CHOSEN["url"]
     for url in upstream_candidates():
         if _healthy(url):
             if url != UPSTREAM_CHOSEN["url"]:
                 print(f"[upstream] using {url}", flush=True)
             UPSTREAM = UPSTREAM_CHOSEN["url"] = url
             UPSTREAM_CHOSEN["at"] = now
+            _UP_CACHE.update(t=now, v=True)
             return url
     UPSTREAM_CHOSEN["at"] = now
     return UPSTREAM_CHOSEN["url"]
@@ -598,8 +710,28 @@ def resolve_loader(ttl: float = 60.0, force: bool = False) -> str:
     return LOADER_URL
 
 
-def server_up() -> bool:
-    return _healthy(resolve_upstream(), 1.2)
+_UP_CACHE: dict[str, Any] = {"t": 0.0, "v": False}
+
+
+def server_up(ttl: float = 0.75) -> bool:
+    """Is the engine reachable? Memoized for `ttl` so one request probes once.
+
+    When nothing is loaded, an unmemoized probe walks every candidate address,
+    and a route that has to time out costs a second each. The UI polls state
+    several times per second, so the answer is kept for under a second.
+    """
+    now = time.time()
+    if now - _UP_CACHE["t"] < ttl:
+        return bool(_UP_CACHE["v"])
+    url = UPSTREAM_CHOSEN["url"]
+    up = _healthy(url, 1.2)
+    if up:
+        UPSTREAM_CHOSEN["at"] = now
+    else:
+        other = resolve_upstream(force=True)     # the engine may be elsewhere
+        up = other != url and _healthy(other, 1.2)
+    _UP_CACHE.update(t=now, v=up)
+    return up
 
 
 _INFO_CACHE: dict[str, Any] = {"t": 0.0, "v": {}}
@@ -797,138 +929,40 @@ def engine_status() -> dict[str, Any]:
                      "this can take several minutes")}
 
 
-def _download(model: str) -> None:
-    from huggingface_hub import snapshot_download
-
-    detail = model_detail(model)
-    expected = max(detail["size_gb"] * 2**30, 1)
-    before = cached_models().get(model, 0.0) * 2**30
-    JOB._set(state="downloading", message=f"fetching {model}", progress=0.0,
-             bytes_total=int(expected), bytes_done=int(before))
-
-    done: dict[str, Any] = {"err": None}
-
-    def work() -> None:
-        try:
-            snapshot_download(repo_id=model, max_workers=4)
-        except Exception as e:
-            done["err"] = f"{type(e).__name__}: {e}"
-
-    t = threading.Thread(target=work, daemon=True)
-    t.start()
-    while t.is_alive():
-        if JOB.cancel.is_set():
-            JOB._set(state="cancelled", message="cancelled by user")
-            raise RuntimeError("cancelled")
-        t.join(1.5)
-        d = HF_CACHE / ("models--" + model.replace("/", "--"))
-        now = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.exists() else 0.0
-        pct = min(99.0, max(0.0, (now - before) / max(expected - before, 1) * 100))
-        JOB._set(progress=round(pct, 1), message=f"downloading {pct:.0f}%",
-                 bytes_done=int(now), bytes_total=int(expected))
-    if done["err"]:
-        raise RuntimeError(done["err"])
-    JOB._set(progress=100.0, message="download complete")
-
-
-def _spawn(model: str, cfg: dict[str, Any]) -> None:
-    cmd = [
-        PY, "-m", "sglang.launch_server",
-        "--model-path", model,
-        "--host", cfg.get("host", "0.0.0.0"),
-        "--port", str(cfg.get("port", 43440)),
-        "--mem-fraction-static", str(cfg["mem_fraction_static"]),
-        "--max-running-requests", str(cfg["max_running_requests"]),
-        "--context-length", str(cfg["context_length"]),
-        "--chunked-prefill-size", str(cfg["chunked_prefill_size"]),
-    ]
-    env = {
-        **os.environ,
-        "SGLANG_USE_MLX": "1",
-        "SGLANG_MLX_CACHE_LIMIT_GB": str(cfg.get("mlx_cache_gb", 1.0)),
-        "SGLANG_MLX_CLEAR_CACHE_STEPS": "64",
-    }
-    log = open(SERVER_LOG, "ab")
-    log.write(f"\n===== workbench load {time.strftime('%Y-%m-%d %H:%M:%S')} {model} =====\n".encode())
-    log.flush()
-    JOB.proc = subprocess.Popen(cmd, stdout=log, stderr=log, cwd=str(ROOT), env=env)
-
-
 def _log_tail(n: int = 25) -> str:
-    if not SERVER_LOG.exists():
-        return ""
-    lines = SERVER_LOG.read_text(errors="replace").replace("\r", "\n").splitlines()
-    return "\n".join(lines[-n:])
+    return log_tail(SERVER_LOG, n)
 
 
-OOM_MARKERS = ("Insufficient Memory", "OutOfMemory", "out of memory")
+def _load_cfg(payload: dict[str, Any]) -> dict[str, Any]:
+    return {**load_settings(), **{k: v for k, v in payload.items() if v is not None}}
 
 
-def _oom_retry(payload: dict[str, Any], tail: str) -> dict[str, Any] | None:
-    if not any(m.lower() in tail.lower() for m in OOM_MARKERS) or payload.get("_oom_retried"):
-        return None
-    ctx = int(payload.get("context_length") or CTX_CEILING)
-    smaller = max(4096, ctx // 2)
-    return {**payload, "context_length": smaller, "_oom_retried": True} if smaller < ctx else None
+def _on_load_ready(cfg: dict[str, Any], model: str, info: dict[str, Any]) -> None:
+    settings = load_settings()
+    settings.update(
+        model=model,
+        context_length=cfg["context_length"],
+        mem_fraction_static=cfg["mem_fraction_static"],
+        max_running_requests=cfg["max_running_requests"],
+        mlx_cache_gb=cfg.get("mlx_cache_gb", 1.0),
+    )
+    save_settings(settings)
+    _INFO_CACHE.update(t=0.0, v={})       # drop the stale pre-load snapshot
+    JOB.set(state="ready", message=f"{model} ready", finished=time.time())
 
 
 def load_worker(payload: dict[str, Any]) -> None:
-    model = payload["model"]
-    settings = load_settings()
-    cfg = {**settings, **{k: v for k, v in payload.items() if v is not None}}
-    JOB.cancel.clear()
-    JOB._set(state="preparing", model=model, progress=0.0, message="checking model",
-             error=None, started=time.time(), finished=None)
-    try:
-        detail = model_detail(model)
-        if not detail["downloaded"]:
-            _download(model)          # the old server keeps answering meanwhile
-        else:
-            JOB._set(progress=100.0, message="already in HF cache")
-
-        if server_up():
-            JOB._set(state="stopping", message="stopping the running server")
-            subprocess.run(["pkill", "-f", "sglang.launch_server --model-path"], capture_output=True)
-            for _ in range(45):
-                if not server_up():
-                    break
-                time.sleep(1)
-            subprocess.run(["pkill", "-9", "-f", "sglang.launch_server --model-path"],
-                           capture_output=True)
-            time.sleep(2)
-
-        JOB._set(state="starting", message="starting sglang", progress=100.0)
-        _spawn(model, cfg)
-        deadline = time.time() + 600
-        while time.time() < deadline:
-            if JOB.cancel.is_set():
-                subprocess.run(["pkill", "-9", "-f", "sglang.launch_server --model-path"],
-                               capture_output=True)
-                JOB._set(state="cancelled", message="cancelled by user")
-                return
-            if server_up():
-                settings.update(
-                    model=model,
-                    context_length=cfg["context_length"],
-                    mem_fraction_static=cfg["mem_fraction_static"],
-                    max_running_requests=cfg["max_running_requests"],
-                    mlx_cache_gb=cfg.get("mlx_cache_gb", 1.0),
-                )
-                save_settings(settings)
-                _INFO_CACHE.update(t=0.0, v={})   # drop the stale pre-load snapshot
-                JOB._set(state="ready", message=f"{model} ready", finished=time.time())
-                return
-            if JOB.proc and JOB.proc.poll() is not None:
-                tail = _log_tail(40)
-                retry = _oom_retry(payload, tail)
-                if retry:
-                    JOB._set(state="starting", message=f"out of memory — retrying with ctx {retry['context_length']}")
-                    return load_worker(retry)
-                raise RuntimeError("server exited during startup:\n" + tail)
-            time.sleep(2)
-        raise RuntimeError("timed out waiting for /health:\n" + _log_tail(20))
-    except Exception as e:
-        JOB._set(state="failed", error=str(e)[:4000], message="load failed", finished=time.time())
+    """Bring up SGLang natively (only possible where the GPU stack lives)."""
+    run_load(
+        JOB, payload,
+        python=PY, hf_cache=HF_CACHE, log_path=SERVER_LOG, root=ROOT,
+        probe_up=server_up,
+        build_cfg=_load_cfg,
+        is_cached=lambda m: bool(model_detail(m)["downloaded"]),
+        expected_bytes=lambda m: max(model_detail(m)["size_gb"] * 2**30, 1),
+        on_ready=_on_load_ready,
+        ctx_ceiling=CTX_CEILING,
+    )
 
 
 def start_load(payload: dict[str, Any]) -> dict[str, Any]:
@@ -941,7 +975,7 @@ def start_load(payload: dict[str, Any]) -> dict[str, Any]:
             f"{PY}. Run the host-side loader (loader_agent.py / run-loader.sh) and set "
             "WORKBENCH_LOADER_URL, or start SGLang yourself and point UPSTREAM at it.",
         )
-    if JOB.snapshot()["state"] in ("preparing", "downloading", "starting", "stopping"):
+    if JOB.busy:
         raise HTTPException(409, "a load is already in progress")
     if not payload.get("model"):
         raise HTTPException(400, "model required")
@@ -958,18 +992,7 @@ def start_load(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def stop_server() -> dict[str, Any]:
-    JOB.cancel.set()
-    if not shutil.which("pkill"):
-        return {"stopped": False,
-                "error": "this deployment cannot signal processes (no pkill); stop SGLang where it runs"}
-    _run(["pkill", "-f", "sglang.launch_server --model-path"])
-    for _ in range(40):
-        if not server_up():
-            break
-        time.sleep(1)
-    _run(["pkill", "-9", "-f", "sglang.launch_server --model-path"])
-    JOB._set(state="idle", message="stopped", progress=0.0)
-    return {"stopped": True}
+    return stop_engine(JOB, server_up)
 
 
 # --------------------------------------------------------------------------- #
@@ -977,16 +1000,22 @@ def stop_server() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
+_WORD_RE = re.compile(r"[a-z0-9]{3,}")
+
+
+@functools.lru_cache(maxsize=4096)
+def _tokens(text: str) -> frozenset[str]:
+    """Lowercased word set for keyword scoring (cached: the same rows recur)."""
+    return frozenset(re.findall(_WORD_RE, (text or "").lower()))
+
+
 def memory_context(query: str, limit: int = 6) -> str:
     with db() as conn:
         rows = conn.execute("SELECT text FROM memory ORDER BY created DESC LIMIT 200").fetchall()
     if not rows:
         return ""
-    words = {w for w in re.findall(r"[a-z0-9]{3,}", (query or "").lower())}
-    scored = []
-    for r in rows:
-        tw = {w for w in re.findall(r"[a-z0-9]{3,}", r["text"].lower())}
-        scored.append((len(words & tw), r["text"]))
+    words = _tokens(query or "")
+    scored = [(len(words & _tokens(r["text"])), r["text"]) for r in rows]
     scored.sort(key=lambda x: (-x[0], len(x[1])))
     picked = [t for s, t in scored[:limit] if s > 0] or [t for _, t in scored[:3]]
     return "\n".join(f"- {p}" for p in picked) if picked else ""
@@ -996,16 +1025,8 @@ def memory_context(query: str, limit: int = 6) -> str:
 # tool harness
 # --------------------------------------------------------------------------- #
 
-TOOL_PROTOCOL = """
-You can use tools. Available tools are listed below as JSON schemas.
-
-To call a tool, reply with ONLY a fenced json block in this exact shape:
-```json
-{"tool": "<tool_name>", "arguments": { ... }}
-```
-Wait for the observation before writing the final answer. Never invent observations.
-Do not wrap the JSON in prose. If no tool is needed, answer normally.
-""".strip()
+# The tool protocol text is part of the harness (dsh/harness.py) and imported
+# above: two copies had already drifted (this one forbade parallel calls).
 
 
 def tool_schemas() -> list[dict[str, Any]]:
@@ -1018,51 +1039,6 @@ def tool_schemas() -> list[dict[str, Any]]:
         }
         for t in all_mcp_tools()
     ]
-
-
-def extract_tool_call(text: str, known: set[str]) -> dict[str, Any] | None:
-    candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    candidates += re.findall(r'(\{[^{}]*"tool"\s*:.*?\})', text, re.S)
-    for blob in candidates:
-        try:
-            obj = json.loads(blob)
-        except Exception:
-            continue
-        name = obj.get("tool") or obj.get("name")
-        if isinstance(name, str) and name in known:
-            args = obj.get("arguments") or obj.get("args") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {"input": args}
-            return {"tool": name, "arguments": args if isinstance(args, dict) else {}}
-    return None
-
-
-async def run_delegate(harness: dict[str, Any], args: dict, params: dict[str, Any]) -> str:
-    """c5: run one named subagent as a nested, tool-free completion."""
-    name = str(args.get("name") or "")
-    task = str(args.get("task") or "")
-    sub = next((x for x in (harness.get("subagents") or []) if x.get("name") == name), None)
-    if not sub:
-        return f"no subagent named {name!r}; available: " + ", ".join(
-            x.get("name", "?") for x in (harness.get("subagents") or []))
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)) as c:
-            r = await c.post(f"{UPSTREAM}/v1/chat/completions", json={
-                "model": params.get("model"),
-                "messages": [
-                    {"role": "system", "content": (sub.get("system") or "You are a focused subagent.") + "\n\nAnswer the delegated task concisely."},
-                    {"role": "user", "content": task},
-                ],
-                "max_tokens": int(params.get("max_tokens", 512)),
-                "temperature": 0.3,
-                "chat_template_kwargs": {"enable_thinking": False},
-            })
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"subagent error: {type(e).__name__}: {e}"
 
 
 async def run_tool(server: str, tool: str, arguments: dict) -> str:
@@ -1084,6 +1060,10 @@ async def run_tool(server: str, tool: str, arguments: dict) -> str:
 class ChatAttachment(BaseModel):
     name: str = Field(examples=["notes.md"])
     text: str = Field(examples=["# Notes"])
+    # where the original file sits on disk. The model needs this to call a
+    # tool on the file itself (e.g. extract_pdf for the full text, the
+    # page-by-page manifest and the images).
+    path: str | None = Field(default=None, examples=["/data/artifacts/abc/report.pdf"])
 
 
 class ChatRequest(BaseModel):
@@ -1305,22 +1285,63 @@ def _xml_text(xml: bytes) -> str:
     return re.sub(r"\n{3,}", "\n\n", raw).strip()
 
 
-def extract_document(name: str, data: bytes) -> tuple[str, dict[str, Any]]:
-    """Return (text, meta) for PDF / DOCX / PPTX / XLSX / plain text. No network, no OCR."""
+def _extract_pdf(name: str, data: bytes, path: str | None = None,
+                 out_dir: Path | None = None) -> tuple[str, dict[str, Any]]:
+    """Extract a PDF with the pdfmcp engine (the same one the MCP tool uses).
+
+    When ``out_dir`` is given, the full extraction -- ``document.md``, the
+    parallel ``manifest.json`` and the images -- is written there as well.
+
+    Falls back to pypdf when pdfmcp is not importable, so a deployment
+    without it still gets text -- just less structure.
+    """
+    tmp: Path | None = None
+    try:
+        from pdfmcp import extract_for_prompt
+    except ImportError:
+        extract_for_prompt = None  # type: ignore[assignment]
+
+    if extract_for_prompt is not None:
+        if path:
+            target = Path(path)
+        else:
+            tmp = Path(tempfile.gettempdir()) / f"pdfmcp-{uuid.uuid4().hex}.pdf"
+            tmp.write_bytes(data)
+            target = tmp
+        try:
+            return extract_for_prompt(target, out_dir=out_dir)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+
+    # pdfmcp is not available: plain pypdf text, no structure
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        raise HTTPException(500, "PDF support missing: neither pdfmcp nor pypdf is installed")
+    reader = PdfReader(io.BytesIO(data))
+    pages = [(pg.extract_text() or "") for pg in reader.pages]
+    text = "\n\n".join(pages).strip()
+    meta = {"kind": "pdf", "pages": len(pages), "backend": "pypdf"}
+    if not text:
+        meta["warning"] = "this PDF has no text layer (it looks like a scan)"
+    return text, meta
+
+
+def extract_document(name: str, data: bytes, path: str | None = None,
+                     out_dir: Path | None = None) -> tuple[str, dict[str, Any]]:
+    """Return (text, meta) for PDF / DOCX / PPTX / XLSX / plain text. No network.
+
+    For a PDF this uses the same engine as the PDF MCP server, so an uploaded
+    PDF gets the same structured markdown, page markers and manifest as a PDF
+    processed through the tool. ``path`` is the file on disk when there is one
+    (the upload endpoint saves first); without it the bytes are written to a
+    temporary file.
+    """
     low = (name or "").lower()
     meta: dict[str, Any] = {"kind": "text"}
     if low.endswith(".pdf"):
-        try:
-            from pypdf import PdfReader
-        except ImportError:
-            raise HTTPException(500, "PDF support missing: pypdf is not installed in this deployment")
-        reader = PdfReader(io.BytesIO(data))
-        pages = [(pg.extract_text() or "") for pg in reader.pages]
-        text = "\n\n".join(pages).strip()
-        meta = {"kind": "pdf", "pages": len(pages)}
-        if not text:
-            raise HTTPException(422, "this PDF has no text layer (scanned image?) — no OCR here")
-        return text, meta
+        return _extract_pdf(name, data, path, out_dir)
     if low.endswith((".docx", ".pptx", ".xlsx")):
         import zipfile
 
@@ -1421,29 +1442,10 @@ def lessons_for(query: str) -> list[dict[str, Any]]:
 # ---- recursive refinement: Propose–Probe–Compose --------------------------- #
 
 
-class HarnessRunJob:
-    """Small background job so the recursion survives a slow local model."""
-
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.cancel = threading.Event()
-        self.thread: threading.Thread | None = None
-        self.state: dict[str, Any] = {
-            "state": "idle", "run_id": None, "harness_id": None, "mode": None, "k": 0,
-            "step": 0, "progress": 0.0, "message": "", "error": None,
-            "started": None, "finished": None, "result": None,
-        }
-
-    def snapshot(self) -> dict[str, Any]:
-        with self.lock:
-            return dict(self.state)
-
-    def _set(self, **kw: Any) -> None:
-        with self.lock:
-            self.state.update(kw)
-
-
-H2_JOB = HarnessRunJob()
+H2_JOB = Job(
+    state="idle", run_id=None, harness_id=None, mode=None, k=0, step=0,
+    progress=0.0, message="", error=None, started=None, finished=None, result=None,
+)
 H2_ACTIVE = ("proposing", "probing", "judging", "composing", "reflecting")
 
 
@@ -1923,11 +1925,22 @@ def _h2_worker(run_id: str, payload: dict[str, Any]) -> None:
         _h2_row_update(run_id, state="failed", error=msg[:2000], finished=h2.now())
 
 
-def effective_tools(harness: dict[str, Any], params: dict[str, Any]) -> list[dict[str, Any]]:
+def effective_tools(harness: dict[str, Any], params: dict[str, Any],
+                    attachments: list[dict] | None = None) -> list[dict[str, Any]]:
     """MCP tools after the harness' allowlist + tool guidance, plus the delegate tool."""
+    schemas = tool_schemas()
+    # An attached PDF always brings its own tools: "upload this PDF and extract
+    # the text" is exactly the case where the tool is needed, and the user
+    # should not have to find the tools switch first.
+    pdf_attached = any((a.get("name") or "").lower().endswith(".pdf")
+                       for a in (attachments or []))
     if not params.get("tools_enabled"):
-        return []
-    tools = h2.filter_tools(tool_schemas(), harness["rules"].get("tool_allowlist") or [])
+        if not pdf_attached:
+            return []
+        schemas = [t for t in schemas if t.get("server") == "pdf"]
+        if not schemas:
+            return []
+    tools = h2.filter_tools(schemas, harness["rules"].get("tool_allowlist") or [])
     tools = h2.apply_tool_guidance(tools, harness.get("tool_guidance") or {})
     # native file tools, always available (they are what makes artifacts possible)
     tools.extend([
@@ -1993,6 +2006,45 @@ def effective_tools(harness: dict[str, Any], params: dict[str, Any]) -> list[dic
     return tools
 
 
+def fit_attachments(attachments: list[dict] | None, settings: dict[str, Any],
+                    used_chars: int = 0) -> list[dict]:
+    """Trim attachment text to what the context window can actually take.
+
+    A PDF that does not fit is replaced by the head of its text plus a
+    pointer to the pdf tools, so the model can pull the rest on demand
+    instead of the request dying with a context overflow.
+    """
+    atts = list(attachments or [])
+    if not atts:
+        return atts
+    ctx = int(settings.get("context_length") or 12288)
+    # ~3 characters per token for real prose, and room for the answer
+    total = max(4000, ctx * 3 - 3000)
+    cap = max(2000, total - used_chars)
+    if sum(len(a.get("text") or "") for a in atts) <= cap:
+        return atts
+
+    per = max(600, cap // len(atts))
+    out: list[dict] = []
+    for a in atts:
+        text = a.get("text") or ""
+        if len(text) <= per:
+            out.append(a)
+            continue
+        name = str(a.get("name") or "")
+        is_pdf = name.lower().endswith(".pdf")
+        head = text[: max(400, per - 400)]
+        if is_pdf and a.get("path"):
+            note = (f"\n\n[truncated to fit the context window: {len(text):,} characters of "
+                    f"text, showing the first {len(head):,}. The complete text, a page-by-page "
+                    f"manifest and the images are available from the file — call extract_pdf with "
+                    f"the path above to read it all.]")
+        else:
+            note = f"\n\n[truncated to fit the context window: {len(text):,} characters, showing {len(head):,}]"
+        out.append({**a, "text": head + note})
+    return out
+
+
 def build_messages(chat_id: str, user_text: str, settings: dict[str, Any],
                    attachments: list[dict] | None = None,
                    harness: dict[str, Any] | None = None) -> tuple[list[dict], dict[str, Any]]:
@@ -2005,9 +2057,9 @@ def build_messages(chat_id: str, user_text: str, settings: dict[str, Any],
         harness, lessons=lessons, memory_text=mem, json_mode=bool(settings.get("json_mode"))
     )
 
-    tools = effective_tools(harness, settings)
+    tools = effective_tools(harness, settings, attachments)
     if tools:
-        system += f"\n\n{h2_tool_protocol()}\n\nTools:\n{json.dumps(tools, ensure_ascii=False)}"
+        system += f"\n\n{TOOL_PROTOCOL}\n\nTools:\n{json.dumps(tools, ensure_ascii=False)}"
 
     with db() as conn:
         rows = conn.execute(
@@ -2021,10 +2073,20 @@ def build_messages(chat_id: str, user_text: str, settings: dict[str, Any],
         if r["content"]:
             msgs.append({"role": r["role"], "content": r["content"]})
     if attachments:
-        for a in attachments:
+        used = sum(len(m.get("content") or "") for m in msgs)
+        for a in fit_attachments(attachments, settings, used):
             name = (a.get("name") or "attachment").strip()
             text = (a.get("text") or "")[:100_000]
-            msgs.append({"role": "user", "content": f"[attached file: {name}]\n```\n{text}\n```"})
+            header = f"[attached file: {name}]"
+            path = (a.get("path") or "").strip()
+            if path:
+                # tell the model where the file is, so a tool can read it
+                if name.lower().endswith(".pdf"):
+                    header += (f"\n[the file is on disk at {path} — call extract_pdf with that path "
+                               f"to get the complete text, a page-by-page manifest and the images]")
+                else:
+                    header += f"\n[the file is on disk at {path}]"
+            msgs.append({"role": "user", "content": f"{header}\n```\n{text}\n```"})
 
     max_tokens = int(harness["rules"].get("max_prompt_tokens") or 0)
     if max_tokens:
@@ -2034,10 +2096,6 @@ def build_messages(chat_id: str, user_text: str, settings: dict[str, Any],
     report["harness_name"] = harness.get("name")
     report["tools"] = [t.get("name") for t in tools]
     return msgs, report
-
-
-def h2_tool_protocol() -> str:
-    return TOOL_PROTOCOL
 
 
 # --------------------------------------------------------------------------- #
@@ -2051,12 +2109,15 @@ def dsh_session_root() -> Path:
 
 
 def dsh_rows_for(chat_id: str, harness: dict[str, Any], params: dict[str, Any],
-                 query: str, holder: dict[str, Any]) -> list[dict[str, Any]]:
+                 query: str, holder: dict[str, Any],
+                 attachments: list[dict] | None = None) -> list[dict[str, Any]]:
     """Patch a workbench harness onto the `workbench` profile."""
     rules = harness.get("rules") or {}
     memory_on = bool(params.get("memory_enabled"))
     lessons = lessons_for(query) if (memory_on and rules.get("include_lessons", True)) else []
-    mcp = tool_schemas() if params.get("tools_enabled") else []
+    # an attached PDF brings its own tools even when the tools switch is off
+    mcp = [t for t in effective_tools(harness, params, attachments)
+           if t.get("server") not in ("artifacts",)]
 
     async def call_tool(server: str, tool: str, args: dict[str, Any]) -> str:
         return await run_tool(server, tool, args)
@@ -2126,17 +2187,12 @@ def api_state() -> dict[str, Any]:
         "can_load_models": bool(LOADER_URL) or Path(PY).exists(),
         "loader_url": LOADER_URL or None,
         "tools": tool_schemas() if s.get("tools_enabled") else [],
-        "mcp": [
-            {"name": c["name"],
-             "enabled": c.get("enabled", True),
-             "connected": bool(MCP_CLIENTS.get(c["name"]) and MCP_CLIENTS[c["name"]].tools)}
-            for c in load_mcp()
-        ],
+        "mcp": mcp_status(),
         "counts": counts,
         "harnesses": [{"id": h["id"], "name": h["name"]} for h in list_harnesses()],
         "harness": {k: v for k, v in get_harness(None, None).items() if k != "id"},
         "harness_components": [{"key": k, "label": lbl} for k, lbl in h2.COMPONENTS],
-        "loop": "legacy" if LEGACY_LOOP else "dsh",
+        "loop": "dsh",
         "profile": dsh_runtime.PROFILE_NAME,
     }
 
@@ -2252,10 +2308,14 @@ def api_upstream() -> dict[str, Any]:
     }
 
 
-@app.get("/api/memory", tags=["system"], summary="Memory picture and a model sizing plan")
-def api_memory(model: str | None = None) -> dict[str, Any]:
+@app.get("/api/memory/plan", tags=["system"], summary="Memory picture and a model sizing plan")
+def api_memory_plan(model: str | None = None) -> dict[str, Any]:
     """Host numbers when a loader agent is configured; otherwise the container's own
-    cgroup view, which is still useful but not what SGLang competes for."""
+    cgroup view, which is still useful but not what SGLang competes for.
+
+    Lives under /api/memory/plan because GET /api/memory is the fact list the
+    memory panel renders — two handlers on one path meant the list never loaded.
+    """
     if LOADER_URL:
         return loader_call("GET", "/memory" + (f"?model={model}" if model else ""))
     from memory import plan, snapshot
@@ -2445,9 +2505,7 @@ def api_message_edit(message_id: str, req: MessageEdit = Body(...)) -> dict[str,
 
 @app.delete("/api/messages/{message_id}", tags=["chats"], summary="Edit or delete one message")
 def api_message_delete(message_id: str) -> dict[str, Any]:
-    with db() as conn:
-        conn.execute("DELETE FROM messages WHERE id=?", (message_id,))
-    return {"deleted": message_id}
+    return _delete_row("messages", "id", message_id)
 
 
 @app.get("/api/chats/{chat_id}/export", tags=["chats"], summary="Export a conversation")
@@ -2511,9 +2569,8 @@ async def api_autotitle(chat_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/memory", tags=["memory"], summary="List or add long-term facts")
-def api_memory() -> list[dict[str, Any]]:
-    with db() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM memory ORDER BY created DESC")]
+def api_memory_list() -> list[dict[str, Any]]:
+    return _rows("memory")
 
 
 @app.post("/api/memory", tags=["memory"], summary="List or add long-term facts")
@@ -2531,15 +2588,12 @@ def api_memory_add(req: MemoryCreate = Body(...)) -> dict[str, Any]:
 
 @app.delete("/api/memory/{mid}", tags=["memory"], summary="Delete a fact")
 def api_memory_delete(mid: str) -> dict[str, Any]:
-    with db() as conn:
-        conn.execute("DELETE FROM memory WHERE id=?", (mid,))
-    return {"deleted": mid}
+    return _delete_row("memory", "id", mid)
 
 
 @app.get("/api/prompts", tags=["prompts"], summary="List or create prompts")
 def api_prompts() -> list[dict[str, Any]]:
-    with db() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM prompts ORDER BY created DESC")]
+    return _rows("prompts")
 
 
 @app.post("/api/prompts", tags=["prompts"], summary="List or create prompts")
@@ -2558,15 +2612,12 @@ def api_prompt_add(req: PromptCreate = Body(...)) -> dict[str, Any]:
 
 @app.delete("/api/prompts/{pid}", tags=["prompts"], summary="Delete a prompt")
 def api_prompt_delete(pid: str) -> dict[str, Any]:
-    with db() as conn:
-        conn.execute("DELETE FROM prompts WHERE id=?", (pid,))
-    return {"deleted": pid}
+    return _delete_row("prompts", "id", pid)
 
 
 @app.get("/api/personas", tags=["personas"], summary="List or create personas")
 def api_personas() -> list[dict[str, Any]]:
-    with db() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM personas ORDER BY created DESC")]
+    return _rows("personas")
 
 
 @app.post("/api/personas", tags=["personas"], summary="List or create personas")
@@ -2587,10 +2638,7 @@ def api_persona_add(req: PersonaCreate = Body(...)) -> dict[str, Any]:
 
 @app.delete("/api/personas/{pid}", tags=["personas"], summary="Delete a persona")
 def api_persona_delete(pid: str) -> dict[str, Any]:
-    with db() as conn:
-        conn.execute("DELETE FROM personas WHERE id=?", (pid,))
-    return {"deleted": pid}
-
+    return _delete_row("personas", "id", pid)
 
 
 # ---- harness (Harness² components) ----------------------------------------- #
@@ -2939,8 +2987,7 @@ def api_h2_adopt(run_id: str, payload: dict = Body(default={})) -> dict[str, Any
 
 @app.get("/api/lessons", tags=["harness"], summary="List stored lessons")
 def api_lessons() -> list[dict[str, Any]]:
-    with db() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM lessons ORDER BY created DESC")]
+    return _rows("lessons")
 
 
 @app.post("/api/lessons", tags=["harness"], summary="Add a lesson")
@@ -2960,9 +3007,7 @@ def api_lesson_add(payload: dict = Body(...)) -> dict[str, Any]:
 
 @app.delete("/api/lessons/{lid}", tags=["harness"], summary="Delete a lesson")
 def api_lesson_delete(lid: str) -> dict[str, Any]:
-    with db() as conn:
-        conn.execute("DELETE FROM lessons WHERE id=?", (lid,))
-    return {"deleted": lid}
+    return _delete_row("lessons", "id", lid)
 
 
 @app.post("/api/lessons/reflect", tags=["harness"],
@@ -3049,11 +3094,16 @@ async def api_upload(chat_id: str, file: UploadFile = File(...)) -> dict[str, An
     if len(data) > 25 * 1024 * 1024:
         raise HTTPException(413, "file larger than 25 MB")
     name = Path(file.filename or "upload").name
-    try:
-        text, meta = extract_document(name, data)
-    except Exception as exc:  # a corrupt or unsupported document must not 500
-        raise HTTPException(400, f"could not read {name}: {type(exc).__name__}: {str(exc)[:200]}") from exc
+    # save first: the file must survive even when the text cannot be read
     art = save_artifact(chat_id, name, data, mime=(file.content_type or "application/octet-stream"))
+    is_pdf = name.lower().endswith(".pdf")
+    try:
+        # for a PDF the full extraction (document.md, manifest.json, images)
+        # is written beside the file in the chat workspace
+        text, meta = extract_document(name, data, path=art["path"],
+                                      out_dir=chat_artifact_dir(chat_id) if is_pdf else None)
+    except Exception as exc:  # a corrupt or unsupported document must not lose the upload
+        raise HTTPException(400, f"could not read {name}: {type(exc).__name__}: {str(exc)[:200]}") from exc
     return {"artifact": art, "name": name, "size": len(data), "chars": len(text), **meta, "text": text}
 
 
@@ -3169,20 +3219,31 @@ def api_mcp_add(req: McpServerCreate = Body(...)) -> dict[str, Any]:
 @app.patch("/api/mcp/servers/{name}", tags=["mcp"], summary="Enable, disable or delete a server")
 def api_mcp_toggle(name: str, req: McpToggle = Body(...)) -> dict[str, Any]:
     payload = req.model_dump()
+    enabled = bool(payload.get("enabled", True))
     servers = load_mcp()
     for s in servers:
         if s["name"] == name:
-            s["enabled"] = bool(payload.get("enabled", True))
+            s["enabled"] = enabled
+            if s.get("bundled"):
+                # remember that this was deliberate, so the default-on
+                # behaviour does not switch it back on the next start
+                s["disabled_by_user"] = not enabled
     save_mcp(servers)
     return {"ok": True}
 
 
 @app.delete("/api/mcp/servers/{name}", tags=["mcp"], summary="Enable, disable or delete a server")
 def api_mcp_delete(name: str) -> dict[str, Any]:
+    entry = next((s for s in load_mcp() if s.get("name") == name), None)
+    if entry and entry.get("bundled"):
+        # bundled servers are re-registered on the next start anyway; say so
+        # instead of silently accepting a delete that will be undone
+        raise HTTPException(400, f"'{name}' is a built-in server and cannot be deleted; "
+                                 f"disable it instead")
     client = MCP_CLIENTS.pop(name, None)
     if client:
         client.close()
-    save_mcp([s for s in load_mcp() if s["name"] != name])
+    save_mcp([s for s in load_mcp() if s.get("name") != name])
     return {"deleted": name}
 
 
@@ -3213,11 +3274,8 @@ async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
 
     The session log is the source of the request: the loop commits the prompt and
     the accepted users, derives and freezes history, streams, runs the guarded
-    tool pipeline and settles every fact durably. Set WORKBENCH_LEGACY_LOOP=1 to
-    fall back to the pre-harness loop.
+    tool pipeline and settles every fact durably.
     """
-    if LEGACY_LOOP:
-        return await _legacy_chat(req)
     payload = req.model_dump()
     chat_id = payload.get("chat_id")
     regenerate = bool(payload.get("regenerate"))
@@ -3228,7 +3286,7 @@ async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
 
     if not server_up():
         state_now = JOB.snapshot()["state"]
-        if state_now in ("preparing", "downloading", "starting", "stopping"):
+        if JOB.busy:
             raise HTTPException(409, f"model is {state_now} — try again when it reports ready")
         raise HTTPException(503, "the model server is down — start one from the model switcher")
 
@@ -3277,7 +3335,13 @@ async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
                 conn.execute("UPDATE chats SET updated=? WHERE id=?", (now, chat_id))
 
     holder: dict[str, Any] = {}
-    host = dsh_mount(dsh_rows_for(chat_id, harness, params, text, holder), holder)
+    # the dsh loop injects the attachment text verbatim, so it has to be
+    # trimmed to what the context window can take before it gets there
+    tool_chars = len(json.dumps(effective_tools(harness, params, attachments), ensure_ascii=False))
+    used_chars = (sum(len(h.get("content") or "") for h in history)
+                  + tool_chars + 3000)
+    attachments = fit_attachments(attachments, params, used_chars)
+    host = dsh_mount(dsh_rows_for(chat_id, harness, params, text, holder, attachments), holder)
     services = host.services()
     started = time.time()
 
@@ -3366,177 +3430,6 @@ async def api_chat(req: ChatRequest = Body(...)) -> StreamingResponse:
     )
 
 
-async def _legacy_chat(req: ChatRequest) -> StreamingResponse:
-    payload = req.model_dump()
-    chat_id = payload.get("chat_id")
-    regenerate = bool(payload.get("regenerate"))
-    text = (payload.get("message") or "").strip()
-    attachments = payload.get("attachments") or []
-    if not chat_id or (not text and not regenerate):
-        raise HTTPException(400, "chat_id and message required (or regenerate=true)")
-
-    if not server_up():
-        state_now = JOB.snapshot()["state"]
-        if state_now in ("preparing", "downloading", "starting", "stopping"):
-            raise HTTPException(409, f"model is {state_now} — try again when it reports ready")
-        raise HTTPException(503, "the model server is down — start one from the model switcher")
-
-    settings = load_settings()
-    params = {**settings, **(payload.get("params") or {})}
-    harness = get_harness(None, chat_id)
-    violations = h2.check_input(harness, text)
-    if violations:
-        raise HTTPException(400, "guardrail: " + "; ".join(violations))
-    tools = effective_tools(harness, params)
-    known = {t["name"] for t in tools}
-
-    now = time.time()
-    with db() as conn:
-        if regenerate:
-            row = conn.execute(
-                "SELECT content FROM messages WHERE chat_id=? AND role='user' ORDER BY created DESC LIMIT 1",
-                (chat_id,),
-            ).fetchone()
-            if not row:
-                raise HTTPException(400, "nothing to regenerate")
-            text = row["content"]
-            conn.execute(
-                "DELETE FROM messages WHERE chat_id=? AND created > (SELECT MAX(created) FROM messages "
-                "WHERE chat_id=? AND role='user')",
-                (chat_id, chat_id),
-            )
-            conn.execute("UPDATE chats SET updated=? WHERE id=?", (now, chat_id))
-        else:
-            conn.execute(
-                "INSERT INTO messages (id,chat_id,role,content,created) VALUES (?,?,?,?,?)",
-                (uuid.uuid4().hex[:12], chat_id, "user", text, now),
-            )
-            t = conn.execute("SELECT title FROM chats WHERE id=?", (chat_id,)).fetchone()
-            if t and t["title"] in (None, "", "New chat"):
-                conn.execute("UPDATE chats SET title=?, updated=? WHERE id=?", (text[:60], now, chat_id))
-            else:
-                conn.execute("UPDATE chats SET updated=? WHERE id=?", (now, chat_id))
-
-    messages, prompt_report = build_messages(chat_id, text, params, attachments)
-    start = time.time()
-
-    async def gen():
-        collected: list[str] = []
-        tool_events: list[dict[str, Any]] = []
-        reasoning: list[str] = []
-        usage_total = {"prompt_tokens": 0, "completion_tokens": 0}
-        rounds = 0
-        yield sse("start", {"chat_id": chat_id, "model": params.get("model")})
-
-        while True:
-            body: dict[str, Any] = {
-                "model": params.get("model"),
-                "messages": messages,
-                "max_tokens": int(params.get("max_tokens", 512)),
-                "temperature": float(params.get("temperature", 0.7)),
-                "top_p": float(params.get("top_p", 0.95)),
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            }
-            if params.get("top_k"):
-                body["top_k"] = int(params["top_k"])
-            if params.get("repeat_penalty"):
-                body["repetition_penalty"] = float(params["repeat_penalty"])
-            if params.get("seed") not in (None, ""):
-                body["seed"] = int(params["seed"])
-            if params.get("stop"):
-                body["stop"] = params["stop"] if isinstance(params["stop"], list) else [params["stop"]]
-            body["chat_template_kwargs"] = {"enable_thinking": bool(params.get("enable_thinking", False))}
-
-            round_text: list[str] = []
-            try:
-                timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    async with client.stream("POST", f"{UPSTREAM}/v1/chat/completions", json=body) as resp:
-                        if resp.status_code != 200:
-                            detail = (await resp.aread()).decode()[:800]
-                            yield sse("error", {"message": f"upstream {resp.status_code}: {detail}"})
-                            break
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data:"):
-                                continue
-                            data = line[5:].strip()
-                            if data == "[DONE]":
-                                break
-                            try:
-                                obj = json.loads(data)
-                            except json.JSONDecodeError:
-                                continue
-                            if obj.get("usage"):
-                                usage_total["prompt_tokens"] = obj["usage"].get("prompt_tokens", 0)
-                                usage_total["completion_tokens"] += obj["usage"].get("completion_tokens", 0)
-                            choice = (obj.get("choices") or [{}])[0]
-                            delta = choice.get("delta") or {}
-                            if delta.get("reasoning_content"):
-                                reasoning.append(delta["reasoning_content"])
-                                yield sse("reasoning", {"text": delta["reasoning_content"]})
-                            if delta.get("content"):
-                                round_text.append(delta["content"])
-                                yield sse("delta", {"text": delta["content"]})
-            except Exception as e:
-                yield sse("error", {"message": f"{type(e).__name__}: {e}"})
-                break
-
-            out = "".join(round_text)
-            call = (extract_tool_call(out, known)
-                    if (known and rounds < int(params.get("max_tool_rounds", 3))) else None)
-            if not call:
-                collected.append(out)
-                break
-
-            rounds += 1
-            tool_name, args = call["tool"], call["arguments"]
-            server = next((t["server"] for t in tools if t["name"] == tool_name), "harness")
-            ev_running = {"tool": tool_name, "server": server, "arguments": args, "state": "running"}
-            yield sse("tool", ev_running)
-            subagent_names = {x.get("name") for x in (harness.get("subagents") or [])}
-            if server == "artifacts":
-                result, art = run_artifact_tool(chat_id, tool_name, args)
-                if art:
-                    yield sse("artifact", art)
-            elif tool_name == "delegate" or tool_name in subagent_names:
-                payload = {"name": args.get("name") or tool_name, "task": args.get("task") or args.get("input") or ""}
-                result = await run_delegate(harness, payload, params)
-            else:
-                result = await run_tool(server, tool_name, args)
-            tool_events.append({**ev_running, "result": result[:4000], "state": "done"})
-            yield sse("tool", {"tool": tool_name, "server": server, "result": result[:4000], "state": "done"})
-            messages.append({"role": "assistant", "content": out})
-            messages.append({
-                "role": "user",
-                "content": f"Observation from {tool_name}:\n{result[:6000]}\n\nContinue. "
-                           "Use another tool call if needed, otherwise answer.",
-            })
-
-        final = "".join(collected).strip()
-        elapsed = round(time.time() - start, 2)
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO messages (id,chat_id,role,content,reasoning,tools,meta,created) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (uuid.uuid4().hex[:12], chat_id, "assistant", final,
-                 "".join(reasoning) or None,
-                 json.dumps({"rounds": rounds, "events": tool_events}) if rounds else None,
-                 json.dumps({"usage": usage_total, "elapsed_s": elapsed, "model": params.get("model"),
-                             "guardrails": h2.check_output(harness, final), "prompt": prompt_report}),
-                 time.time()),
-            )
-            conn.execute("UPDATE chats SET updated=? WHERE id=?", (time.time(), chat_id))
-        problems = h2.check_output(harness, final)
-        yield sse("done", {"text": final, "usage": usage_total, "elapsed_s": elapsed, "rounds": rounds,
-                           "guardrails": problems, "prompt": prompt_report})
-
-    return StreamingResponse(
-        gen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
 # ---- static ---------------------------------------------------------------- #
 
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
@@ -3558,6 +3451,27 @@ def _startup_discovery() -> None:
     print(f"[startup] upstream={url} loader={loader or '(none)'}", flush=True)
 
 
+def _connect_bundled_mcp() -> None:
+    """Connect the bundled servers at startup so their tools are live.
+
+    Without this the tools only appear once something calls a tool or the
+    user presses "connect" in the MCP panel. Connecting here means a fresh
+    workbench can extract a PDF right away. A failure is not fatal: the
+    server stays registered and can be connected from the UI.
+    """
+    for cfg in load_mcp():
+        if cfg.get("enabled") is False:
+            continue
+        name = cfg.get("name") or ""
+        try:
+            client = mcp_client(name)
+            tools = client.refresh_tools()
+            print(f"[startup] mcp '{name}': {len(tools)} tools", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[startup] mcp '{name}' failed: {type(exc).__name__}: {exc}",
+                  flush=True)
+
+
 def main() -> None:
     global UPSTREAM, PORT
     ap = argparse.ArgumentParser()
@@ -3569,10 +3483,12 @@ def main() -> None:
     PORT = a.port
     init_db()
     ensure_demo_mcp()
+    ensure_pdf_mcp()
     if not SETTINGS_PATH.exists():
         save_settings(DEFAULT_SETTINGS)
     print(f"SGLang Workbench v2  http://{a.host}:{a.port}  -> upstream {UPSTREAM}")
     _startup_discovery()
+    _connect_bundled_mcp()
     import uvicorn
 
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")

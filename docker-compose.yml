@@ -36,6 +36,10 @@ services:
       WORKBENCH_CORS_ORIGINS: ${WORKBENCH_CORS_ORIGINS:-*}
       WORKBENCH_DATA: /data
       WORKBENCH_ROOT: /app
+      # Where the PDF MCP server writes document.md / manifest.json / images.
+      # Inside the container this lands on the ./data bind mount, so the
+      # extractions survive a rebuild.
+      PDFMCP_OUT: /data/pdf-extracts
       # The model the external engine is expected to serve. Lets the UI show
       # "downloading Qwen/Qwen3-4B 42%" even though compose, not this app,
       # owns the engine process.
@@ -99,6 +103,43 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The PDF extraction MCP server, over streamable-http. Optional: the
+  # workbench already talks to it over stdio as a child process, so this
+  # service is only for clients that expect an HTTP MCP endpoint
+  # (Open-WebUI and similar). Start it with:
+  #
+  #   docker compose --profile pdf up -d
+  #
+  # then point the client at http://localhost:8510/mcp
+  pdf-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sglang-workbench:2.0.0
+    container_name: ${PDF_MCP_CONTAINER:-sglang-pdf-mcp}
+    profiles: ["pdf"]
+    command: ["python", "pdfmcp_server.py", "--http", "--host", "0.0.0.0", "--port", "8500"]
+    ports:
+      - "${PDF_MCP_PORT:-8510}:8500"
+    environment:
+      WORKBENCH_DATA: /data
+      WORKBENCH_ROOT: /app
+      PDFMCP_OUT: /data/pdf-extracts
+    volumes:
+      - "${WORKBENCH_DATA_DIR:-./data}:/data"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8500/mcp', timeout=3).status in (200, 400, 406) else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     logging:
       driver: json-file
       options:

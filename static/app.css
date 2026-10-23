@@ -707,6 +707,47 @@ html[data-theme="light"] .body pre{background:var(--code-bg);border-color:#24242
   font-size:11.4px;color:var(--fg-dim);
 }
 .file-chip button{background:none;border:0;color:var(--fg-mute);cursor:pointer;font-size:13px;line-height:1}
+
+/* --- MCP servers, shown in the composer ------------------------------- */
+.mcp-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+.mcp-chip{
+  display:inline-flex;align-items:center;gap:6px;cursor:pointer;
+  background:var(--panel);border:1px solid var(--line2);border-radius:999px;
+  padding:3px 10px;font-size:11.4px;color:var(--fg-dim);font-family:inherit;
+  max-width:100%;
+}
+.mcp-chip:hover{border-color:var(--fg-mute);color:var(--fg)}
+.mcp-chip .dot{width:7px;height:7px;border-radius:50%;background:var(--fg-mute);flex:0 0 auto}
+.mcp-chip.on .dot{background:#3fb950}
+.mcp-chip.idle .dot{background:#d29922}
+.mcp-chip.off{opacity:.55}
+.mcp-chip .nm{font-weight:600;color:var(--fg)}
+.mcp-chip.off .nm{color:var(--fg-dim)}
+.mcp-chip .n{font-variant-numeric:tabular-nums;color:var(--fg-mute)}
+.mcp-chip.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.mcp-manage{
+  background:none;border:1px dashed var(--line2);border-radius:999px;
+  padding:3px 10px;font-size:11.4px;color:var(--fg-mute);cursor:pointer;font-family:inherit;
+}
+.mcp-manage:hover{color:var(--fg);border-color:var(--fg-mute)}
+.mcp-detail{
+  margin:0 0 8px;padding:8px 10px;border:1px solid var(--line2);border-radius:10px;
+  background:var(--panel);max-height:190px;overflow:auto;
+}
+.mcp-detail .hd{
+  display:flex;align-items:baseline;gap:8px;font-size:11.6px;color:var(--fg);
+  font-weight:600;margin-bottom:6px;
+}
+.mcp-detail .hd .sub{font-weight:400;color:var(--fg-mute);font-size:11px}
+.mcp-tool{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;padding:3px 0;align-items:baseline}
+.mcp-tool code{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.2px;
+  color:var(--fg);white-space:nowrap;
+}
+.mcp-tool .desc{color:var(--fg-dim);font-size:11.2px;line-height:1.45;min-width:0}
+.mcp-tool .params{color:var(--fg-mute);font-size:10.6px}
+.mcp-detail .none{color:var(--fg-mute);font-size:11.4px}
+.mcp-detail .req{color:#f0883e}
 .btn.send{
   background:var(--btn);color:var(--btn-fg);border:0;border-radius:50%;width:34px;height:34px;padding:0;
   display:grid;place-items:center;box-shadow:none;flex:0 0 auto;

@@ -144,7 +144,16 @@ class Agent:
         if text is not None:
             self.followup(text)
         for att in (attachments or []):
-            self.inject(f"[attached file: {att.get('name') or 'attachment'}]\n```\n"
+            header = f"[attached file: {att.get('name') or 'attachment'}]"
+            path = str(att.get("path") or "").strip()
+            if path:
+                # the model needs the path to run a tool on the file itself
+                if str(att.get("name") or "").lower().endswith(".pdf"):
+                    header += (f"\n[the file is on disk at {path} — call extract_pdf with that path "
+                               f"to get the complete text, a page-by-page manifest and the images]")
+                else:
+                    header += f"\n[the file is on disk at {path}]"
+            self.inject(f"{header}\n```\n"
                         f"{str(att.get('text') or '')[:100_000]}\n```", source="attachment")
         if not self.inbox and not self.injected:
             yield {"type": "error", "message": "nothing to run"}

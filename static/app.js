@@ -10,6 +10,7 @@ const state = {
   streaming: false,
   abort: null,
   tools: [],
+  mcp: [],
   server: {},
   job: {},
   engine: {},
@@ -578,7 +579,7 @@ function updateCtxMeter() {
   const chars = state.messages.reduce((a, m) => a + (m.content || '').length, 0) +
                 (state.settings.system_prompt || '').length + $('#input').value.length +
                 state.attachments.reduce((a, f) => a + f.text.length, 0);
-  const tokens = Math.ceil(chars / 4);
+  const tokens = Math.ceil(chars / 3);
   const pct = Math.min(999, Math.round((tokens / ctx) * 100));
   const el = $('#ctxMeter');
   el.textContent = `ctx ${pct}%`;
@@ -638,14 +639,10 @@ async function sendMessage(textOverride) {
   let chars = 0;
 
   try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: state.abort.signal,
-      body: JSON.stringify({ chat_id: state.chatId, message: text, attachments }),
-    });
-    if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+    const res = await openChatStream({ chat_id: state.chatId, message: text, attachments });
 
+    const listEl = $('#messages');
+    const hintEl = $('#streamHint');
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
@@ -665,13 +662,15 @@ async function sendMessage(textOverride) {
           assistant.content += data.text;
           chars += data.text.length;
           const now = performance.now();
+          // re-render and re-layout at most every 120 ms: marked + syntax
+          // highlighting over the whole answer on every token is quadratic
           if (now - (assistant._lastRender || 0) > 120) {
             assistant._lastRender = now;
             bodyEl.innerHTML = md(assistant.content) + '<span class="cursor"></span>';
+            const secs = Math.max(0.001, (now - t0) / 1000);
+            hintEl.textContent = `~${Math.round(chars / 4 / secs)} tok/s`;
+            listEl.scrollTop = listEl.scrollHeight;
           }
-          const secs = Math.max(0.001, (performance.now() - t0) / 1000);
-          $('#streamHint').textContent = `~${Math.round(chars / 4 / secs)} tok/s`;
-          $('#messages').scrollTop = $('#messages').scrollHeight;
         } else if (ev === 'reasoning') {
           assistant.reasoning += data.text;
           thinkEl.style.display = 'block';
@@ -690,7 +689,7 @@ async function sendMessage(textOverride) {
               last.querySelector('pre').textContent = data.result || '(no output)';
             }
           }
-          $('#messages').scrollTop = $('#messages').scrollHeight;
+          listEl.scrollTop = listEl.scrollHeight;
         } else if (ev === 'artifact') {
           assistant.artifacts = assistant.artifacts || [];
           assistant.artifacts.push(data);
@@ -732,18 +731,27 @@ async function sendMessage(textOverride) {
   }
 }
 
+async function openChatStream(body) {
+  /** POST /api/chat and hand back the raw SSE response (caller reads the body). */
+  const res = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: state.abort.signal,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+  return res;
+}
+
 async function regenerate() {
   if (state.streaming || !state.chatId) return;
   state.streaming = true;
   state.abort = new AbortController();
   setSendState();
   try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: state.abort.signal,
-      body: JSON.stringify({ chat_id: state.chatId, regenerate: true }),
-    });
+    // the answer is rendered from the server afterwards, so the stream only
+    // has to be consumed — but it must not be re-implemented here
+    const res = await openChatStream({ chat_id: state.chatId, regenerate: true });
     await res.text();
   } catch (e) {
     if (e.name !== 'AbortError') toast(e.message, 'err');
@@ -792,7 +800,9 @@ const MAX_UPLOAD = 25 * 1024 * 1024;
 
 function contextCharBudget() {
   const ctx = Number(state.settings.context_length) || 12288;
-  return Math.max(4000, Math.floor((ctx - 2500) * 3.4));
+  // ~3 chars per token, leaving room for the answer -- the server trims to
+  // the same budget, so this is only about not shipping text we will drop
+  return Math.max(4000, Math.floor(ctx * 3 - 3000));
 }
 
 async function uploadDocument(file) {
@@ -821,8 +831,12 @@ async function addFiles(files) {
         state.attachments.push({
           name: r.name, text, kind: r.kind, pages: r.pages, slides: r.slides,
           chars: r.chars, truncated,
+          // keep the path: the model needs it to run a tool on the file
+          path: (r.artifact && r.artifact.path) || null,
+          manifest: r.manifest || null,
         });
-        toast(`${r.name}: ${r.chars.toLocaleString()} chars${r.pages ? ` from ${r.pages} pages` : ''}${truncated ? ' (trimmed to context)' : ''}`);
+        const warn = r.warning ? ` — ${r.warning}` : '';
+        toast(`${r.name}: ${r.chars.toLocaleString()} chars${r.pages ? ` from ${r.pages} pages` : ''}${truncated ? ' (trimmed to context)' : ''}${warn}`);
         loadFiles();
       }
     } catch (e) {
@@ -1164,6 +1178,7 @@ async function refreshState() {
     const s = await api('/api/state');
     state.settings = s.settings;
     state.tools = s.tools || [];
+    state.mcp = s.mcp || [];
     state.server = s.server || {};
     state.job = s.job || {};
     state.engine = s.engine || {};
@@ -1193,8 +1208,10 @@ async function refreshState() {
     $('#memChip').textContent = s.settings.memory_enabled ? 'memory on' : 'memory off';
     if (s.harness && $('#harnessChip')) $('#harnessChip').textContent = `harness ${s.harness.name}`;
     $('#memChip').className = 'chip' + (s.settings.memory_enabled ? ' on' : '');
-    $('#toolCount').textContent = state.tools.length;
+    $('#toolCount').textContent = mcpAvailableToolCount();
     $('#toolsToggle').classList.toggle('on', !!s.settings.tools_enabled);
+    $('#toolsToggle').title = mcpToolsTooltip();
+    renderMcpRow();
     $('#thinkToggle').classList.toggle('on', !!s.settings.enable_thinking);
     const chipBusy = jobActive || engActive;
     $('#jobChip').hidden = !(chipBusy || engFailed);
@@ -1431,6 +1448,132 @@ async function loadPrompts() {
 }
 
 /* ------------------------------ MCP ------------------------------ */
+let mcpOpenServer = null;   // which server's tools are expanded in the composer
+
+function mcpServerLabel(s) {
+  const n = (s.tools || []).length;
+  if (s.enabled === false) return 'off';
+  if (!s.connected) return 'not connected';
+  return `${n} tool${n === 1 ? '' : 's'}`;
+}
+
+function mcpAvailableToolCount() {
+  return (state.mcp || []).reduce(
+    (n, s) => n + (s.connected && s.enabled !== false ? (s.tools || []).length : 0), 0);
+}
+
+function mcpToolsTooltip() {
+  const servers = state.mcp || [];
+  const on = !!(state.settings || {}).tools_enabled;
+  if (!servers.length) return 'No MCP servers registered';
+  const lines = servers.map((s) => {
+    const names = (s.tools || []).map((t) => t.name).join(', ');
+    const head = `${s.name} (${mcpServerLabel(s)})`;
+    return names ? `${head}: ${names}` : head;
+  });
+  const total = mcpAvailableToolCount();
+  return `${on ? `Tools are sent to the model (${total}).` : 'Tools are NOT sent to the model.'}\n\n${lines.join('\n')}`;
+}
+
+function renderMcpDetail() {
+  const box = $('#mcpDetail');
+  if (!box) return;
+  const s = (state.mcp || []).find((x) => x.name === mcpOpenServer);
+  if (!s) { box.hidden = true; box.innerHTML = ''; return; }
+  box.hidden = false;
+  box.innerHTML = '';
+
+  const hd = document.createElement('div');
+  hd.className = 'hd';
+  const nm = document.createElement('span');
+  nm.textContent = s.name;
+  const sub = document.createElement('span');
+  sub.className = 'sub';
+  const where = s.bundled ? 'built in' : 'added';
+  const how = s.enabled === false ? 'disabled' : (s.connected ? 'connected' : 'not connected');
+  sub.textContent = `${where} · ${how}`;
+  hd.append(nm, sub);
+  box.appendChild(hd);
+
+  const tools = s.tools || [];
+  if (!tools.length) {
+    const none = document.createElement('div');
+    none.className = 'none';
+    none.textContent = s.enabled === false
+      ? 'This server is disabled — turn it on in the MCP panel to use its tools.'
+      : 'No tools discovered. Connect the server from the MCP panel.';
+    box.appendChild(none);
+    return;
+  }
+  for (const t of tools) {
+    const row = document.createElement('div');
+    row.className = 'mcp-tool';
+    const code = document.createElement('code');
+    code.textContent = t.name;
+    const desc = document.createElement('div');
+    desc.className = 'desc';
+    // the first line of the description is the summary; the rest is detail
+    const lines = (t.description || '').split('\n').filter((l) => l.trim());
+    const summary = lines[0] || '';
+    desc.appendChild(document.createTextNode(summary));
+    if (t.params && t.params.length) {
+      const p = document.createElement('div');
+      p.className = 'params';
+      const req = new Set(t.required || []);
+      p.textContent = '(' + t.params.map((x) => (req.has(x) ? x : `[${x}]`)).join(', ') + ')';
+      desc.appendChild(p);
+    }
+    row.append(code, desc);
+    box.appendChild(row);
+  }
+}
+
+function renderMcpRow() {
+  const row = $('#mcpRow');
+  if (!row) return;
+  const servers = state.mcp || [];
+  row.innerHTML = '';
+  if (!servers.length) {
+    row.hidden = true;
+    mcpOpenServer = null;
+    renderMcpDetail();
+    return;
+  }
+  row.hidden = false;
+  for (const s of servers) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    const cls = s.enabled === false ? 'off' : (s.connected ? 'on' : 'idle');
+    chip.className = 'mcp-chip ' + cls + (s.name === mcpOpenServer ? ' active' : '');
+    chip.title = s.connected
+      ? `${s.name}: ${mcpServerLabel(s)} — click to list the tools`
+      : `${s.name}: ${mcpServerLabel(s)}`;
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = s.name;
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = mcpServerLabel(s);
+    chip.append(dot, nm, n);
+    chip.onclick = () => {
+      mcpOpenServer = mcpOpenServer === s.name ? null : s.name;
+      renderMcpRow();
+      renderMcpDetail();
+    };
+    row.appendChild(chip);
+  }
+  const manage = document.createElement('button');
+  manage.type = 'button';
+  manage.className = 'mcp-manage';
+  manage.textContent = 'manage';
+  manage.title = 'Open the MCP panel';
+  manage.onclick = () => openPanel('mcp');
+  row.appendChild(manage);
+  renderMcpDetail();
+}
+
 async function loadMcp() {
   const rows = await api('/api/mcp/servers');
   const list = $('#mcpList');
@@ -1444,12 +1587,14 @@ async function loadMcp() {
         <button class="mini t">${r.enabled === false ? 'off' : 'on'}</button>
         <button class="mini c">connect</button><button class="mini d">×</button>
       </div>`;
-    el.querySelector('.mid').textContent = r.name;
+    el.querySelector('.mid').textContent = r.bundled ? `${r.name} (built in)` : r.name;
     el.querySelector('.meta').textContent = r.connected
       ? `${r.tools.length} tools: ${r.tools.join(', ')}` : r.command;
     el.querySelector('.t').onclick = async () => {
+      // a missing "enabled" means on; only an explicit false is off
+      const nowOn = r.enabled !== false;
       await api(`/api/mcp/servers/${encodeURIComponent(r.name)}`, {
-        method: 'PATCH', body: { enabled: r.enabled === false },
+        method: 'PATCH', body: { enabled: !nowOn },
       });
       loadMcp(); refreshState();
     };
@@ -1461,8 +1606,14 @@ async function loadMcp() {
       } catch (e) { toast(e.message, 'err'); }
     };
     el.querySelector('.d').onclick = async () => {
-      await api(`/api/mcp/servers/${encodeURIComponent(r.name)}`, { method: 'DELETE' });
-      loadMcp(); refreshState();
+      if (r.bundled) {
+        toast('Built-in servers cannot be deleted — disable it instead', 'err');
+        return;
+      }
+      try {
+        await api(`/api/mcp/servers/${encodeURIComponent(r.name)}`, { method: 'DELETE' });
+        loadMcp(); refreshState();
+      } catch (e) { toast(e.message, 'err'); }
     };
     list.appendChild(el);
   }

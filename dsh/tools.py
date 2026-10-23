@@ -22,10 +22,6 @@ __all__ = ["Tool", "ToolRuntime", "ToolResult", "ExecContext", "ToolsPlugin",
            "validate_arguments"]
 
 
-def _maybe_await(value: Any) -> Any:
-    return value
-
-
 async def _await_if_needed(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value

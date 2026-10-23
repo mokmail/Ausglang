@@ -18,11 +18,14 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py ./
+COPY loader_core.py ./
 COPY harness2_lite.py ./
 COPY memory.py ./
 COPY dsh ./dsh
 COPY static ./static
 COPY mcp_demo_server.py ./
+COPY pdfmcp ./pdfmcp
+COPY pdfmcp_server.py ./
 COPY README.md ./
 
 RUN useradd --system --uid 10001 --create-home app \
